@@ -1,5 +1,5 @@
 ---
-name: connect
+name: coding-productivity:connect
 description: 'Connect to an existing BigQuery dataset for read-only analysis. Use when you have access to a pre-populated dataset and want to explore results without running extraction.'
 ---
 

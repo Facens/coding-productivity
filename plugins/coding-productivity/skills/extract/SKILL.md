@@ -1,5 +1,5 @@
 ---
-name: extract
+name: coding-productivity:extract
 description: 'Extract commits, diffs, and merge/pull requests from configured GitHub or GitLab repositories. Use after setup to populate the local database, or re-run to fetch new data.'
 argument-hint: '[optional: repo slug to extract a single repo, e.g. "owner/repo"]'
 ---
