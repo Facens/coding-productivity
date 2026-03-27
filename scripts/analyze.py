@@ -443,7 +443,8 @@ def code_efficiency(storage: Storage, config: Config,
     WITH commit_merged AS (
         SELECT DISTINCT mc.commit_sha
         FROM mr_commits mc
-        JOIN merge_requests mr ON mc.mr_id = mr.mr_id
+        JOIN merge_requests mr
+            ON mc.mr_iid = mr.mr_iid AND mc.project_id LIKE '%' || mr.project_name
         WHERE mr.state = 'merged'
     )
     SELECT

@@ -453,18 +453,24 @@ def _extract_pr_commit_links(
     slug = repo.replace("/", "_")
 
     # Get PR IIDs that are in storage but have no links yet.
+    # merge_requests stores short project_name (e.g., "admin"),
+    # while repo is full path (e.g., "team-blue-Hub/admin").
+    repo_short = repo.split("/")[-1] if "/" in repo else repo
+
     try:
         pr_rows = storage.query(
-            f"SELECT DISTINCT mr_iid FROM merge_requests "
-            f"WHERE project_path = '{repo}'"
+            "SELECT DISTINCT mr_iid FROM merge_requests "
+            "WHERE project_name = $repo_name",
+            {"repo_name": repo_short},
         )
     except Exception:
         pr_rows = []
 
     try:
         linked_rows = storage.query(
-            f"SELECT DISTINCT mr_iid FROM mr_commits "
-            f"WHERE project_id = '{repo}'"
+            "SELECT DISTINCT mr_iid FROM mr_commits "
+            "WHERE project_id = $repo_slug",
+            {"repo_slug": repo},
         )
         linked_iids = {str(r["mr_iid"]) for r in linked_rows}
     except Exception:
