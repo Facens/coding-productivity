@@ -6,7 +6,7 @@ Measure the impact of AI coding tools (Copilot, Cursor, Claude Code) on your tea
 
 | Type | Count |
 |------|-------|
-| Skills | 8 |
+| Skills | 9 |
 | Python modules | 11 |
 | MCP Servers | 0 |
 
@@ -47,7 +47,8 @@ Optional:
 | Skill | Description |
 |-------|-------------|
 | `setup` | Interactive configuration wizard |
-| `extract` | Run extraction pipeline (GitHub/GitLab) |
+| `run` | Full pipeline: extract → score → analyze. Accepts date range (e.g., `run January 2026`) |
+| `extract` | Pull commits, diffs, PRs. Accepts date range or repo slug |
 | `score` | AI-powered commit scoring via Claude Haiku |
 | `analyze` | Interactive productivity analysis |
 | `report` | Generate executive summary in markdown |

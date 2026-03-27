@@ -1,7 +1,7 @@
 ---
 name: coding-productivity:extract
 description: 'Extract commits, diffs, and merge/pull requests from configured GitHub or GitLab repositories. Use after setup to populate the local database, or re-run to fetch new data.'
-argument-hint: '[optional: repo slug to extract a single repo, e.g. "owner/repo"]'
+argument-hint: '[date range, e.g. "February 2026", "2025-06 to 2025-12", or repo slug "owner/repo"]'
 ---
 
 # Extract Repository Data

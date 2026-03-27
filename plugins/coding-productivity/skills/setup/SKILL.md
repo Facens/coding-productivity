@@ -186,7 +186,9 @@ AI Scoring:     {Enabled/Disabled}
 ```
 
 If anonymization enabled:
-> **Back up your pseudonymization key.** Losing it means existing hashes become permanently unresolvable.
+> **Back up your pseudonymization key.** It is stored in `.coding-productivity.env` (the `PSEUDONYMIZATION_KEY` field). Losing it means existing hashes become permanently unresolvable. Copy this file to a safe location outside this project.
+
+Display the path to the config file as a clickable reference.
 
 Then:
 
