@@ -13,7 +13,13 @@ Measure the impact of AI coding tools (Copilot, Cursor, Claude Code) on your tea
 ## Install
 
 ```bash
-# Clone and install from local path
+# Add the marketplace and install
+claude marketplace add https://github.com/Facens/coding-productivity.git
+claude plugin install coding-productivity
+```
+
+Or install from a local clone:
+```bash
 git clone https://github.com/Facens/coding-productivity.git
 claude plugin install ./coding-productivity
 ```

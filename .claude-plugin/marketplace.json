@@ -1,0 +1,31 @@
+{
+  "name": "coding-productivity-marketplace",
+  "owner": {
+    "name": "Facens",
+    "url": "https://github.com/Facens"
+  },
+  "metadata": {
+    "description": "Coding productivity analysis plugin for Claude Code",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "coding-productivity",
+      "description": "Measure AI coding tool impact with commit-level extraction, optional AI scoring, and productivity analysis for GitHub and GitLab codebases.",
+      "author": {
+        "name": "Facens",
+        "url": "https://github.com/Facens"
+      },
+      "homepage": "https://github.com/Facens/coding-productivity",
+      "tags": [
+        "productivity",
+        "ai-tools",
+        "github",
+        "gitlab",
+        "commit-analysis",
+        "developer-metrics"
+      ],
+      "source": "."
+    }
+  ]
+}
