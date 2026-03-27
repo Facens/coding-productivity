@@ -1,6 +1,0 @@
-{
-  "name": "coding-productivity",
-  "displayName": "Coding Productivity Analyzer",
-  "version": "0.1.0",
-  "description": "Measure AI coding tool impact with commit-level extraction, optional AI scoring, and productivity analysis for GitHub and GitLab codebases."
-}
