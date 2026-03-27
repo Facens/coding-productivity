@@ -76,7 +76,7 @@ A local reverse mapping file (`.coding-productivity/developer_mapping.json`) all
 
 - Claude Code (CLI or IDE extension)
 - Python 3.10+
-- API token for your Git platform (GitHub PAT or GitLab PAT)
+- API token for your Git platform (or use existing `gh`/`glab` CLI authentication)
 - Anthropic API key (only if AI scoring is enabled)
 
 ## Security Notes

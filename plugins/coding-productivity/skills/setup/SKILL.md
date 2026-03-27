@@ -39,27 +39,34 @@ Save the choice. If GitLab, also ask:
 
 ### Step 2: API Token
 
-**MANDATORY: Before asking the user for ANY token, run this Bash command first:**
+**MANDATORY FIRST ACTION — run this before showing any prompt to the user.**
 
-For GitHub:
-```bash
-gh auth token 2>/dev/null
+First, find the plugin's scripts directory:
+```
+find ~/.claude/plugins -path "*/coding-productivity/scripts/detect_token.py" 2>/dev/null | head -1
 ```
 
-For GitLab:
-```bash
-glab config get token 2>/dev/null
+Then run the token detection script using the found path:
+```
+python3 /path/to/detect_token.py github
+```
+or for GitLab:
+```
+python3 /path/to/detect_token.py gitlab --url GITLAB_URL
 ```
 
-**If the command returns a non-empty token string**, DO NOT ask the user to paste a token. Instead ask:
+Use the Bash tool for both commands. Check the exit code of the second command.
 
-> Found an existing `gh` CLI authentication. Use this token?
->
-> 1. Yes, use the CLI token (Recommended)
-> 2. No, I'll provide a different token
+**If exit code is 0** (token found — printed to stdout):
+- Store the token value
+- Ask the user via AskUserQuestion:
+  - Question: "Found an existing CLI authentication. Use this token?"
+  - Option 1: "Yes, use the detected token (Recommended)"
+  - Option 2: "No, I'll provide a different token"
+- If the user picks option 1, use the detected token and skip to Step 3.
 
-**Only if the command fails/returns empty, OR the user chose option 2**, ask:
-> Please paste your [GitHub/GitLab] API token.
+**If exit code is 1** (no token found), or user picked option 2, ask:
+> Please paste your GitHub/GitLab API token.
 
 **Validate the token immediately** by calling the platform API:
 
@@ -76,7 +83,7 @@ glab config get token 2>/dev/null
   A `200` response means the token is valid.
 
 **On failure**, display the error and explain the required scopes:
-- **GitHub**: Needs `repo` scope (classic PAT) or fine-grained PAT with Contents + Pull Requests read access. Link: `https://github.com/settings/tokens`
+- **GitHub**: Needs `repo` scope (classic token) or a fine-grained token with Contents + Pull Requests read access. Create one at: `https://github.com/settings/tokens`
 - **GitLab**: Needs `read_api` scope. Link: `GITLAB_URL/-/user_settings/personal_access_tokens`
 
 Ask the user to try again. Do not proceed until validation succeeds.
