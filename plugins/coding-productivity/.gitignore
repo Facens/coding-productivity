@@ -1,0 +1,20 @@
+# Config and credentials
+.coding-productivity.env
+.coding-productivity/
+developer_mapping.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+__pycache__/
