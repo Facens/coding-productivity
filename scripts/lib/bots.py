@@ -50,10 +50,17 @@ _compiled_patterns: list[re.Pattern] = [re.compile(p, re.IGNORECASE) for p in BO
 
 def is_bot(name: str = "", email: str = "") -> bool:
     """Return ``True`` if the name/email belongs to a known bot account."""
-    if name.strip() in BOT_NAMES:
+    name_stripped = name.strip()
+    if name_stripped in BOT_NAMES:
+        return True
+    # Any name containing [bot] is a bot
+    if "[bot]" in name_stripped.lower():
         return True
     email_lower = email.strip().lower()
     if email_lower in BOT_EMAILS:
+        return True
+    # Check email patterns (both local part and domain)
+    if "noreply" in email_lower or "[bot]" in email_lower:
         return True
     for pattern in _compiled_patterns:
         if pattern.match(email_lower):
