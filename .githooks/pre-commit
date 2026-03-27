@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -e
+
+PLUGIN_DIR="$(git rev-parse --show-toplevel)"
+VENV="$PLUGIN_DIR/.coding-productivity/.venv/bin/python"
+
+# Check venv exists
+if [ ! -f "$VENV" ]; then
+    echo "⚠ Venv not found. Run: python3 scripts/setup_env.py"
+    echo "  Skipping tests."
+    exit 0
+fi
+
+echo "Running tests..."
+"$VENV" -m pytest "$PLUGIN_DIR/tests/" -q --tb=short
