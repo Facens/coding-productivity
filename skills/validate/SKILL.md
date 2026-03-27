@@ -1,6 +1,7 @@
 ---
 name: validate
 description: 'Compare plugin analysis results against a reference dataset to verify correctness. Use to validate a new instance against known-good results, or generate a reference snapshot.'
+argument-hint: '[reference file path, or "generate" to create a snapshot]'
 ---
 
 # Validation for coding-productivity

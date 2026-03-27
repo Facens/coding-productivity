@@ -1,6 +1,7 @@
 ---
 name: analyze
 description: 'Run interactive productivity analysis on extracted data. Use after extraction to view monthly trends, before/after comparisons, per-author metrics, merge velocity, and category breakdowns.'
+argument-hint: '[query type: trends, comparison, authors, velocity, categories, efficiency]'
 ---
 
 # Analyze Productivity Data

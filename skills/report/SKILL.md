@@ -1,6 +1,7 @@
 ---
 name: report
 description: 'Generate a comprehensive executive summary of coding productivity analysis in markdown. Use to create a shareable report document.'
+argument-hint: '[date range, e.g. "2025-01 to 2026-03"]'
 ---
 
 # Generate Executive Productivity Report

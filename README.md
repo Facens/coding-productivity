@@ -2,6 +2,14 @@
 
 Measure the impact of AI coding tools (Copilot, Cursor, Claude Code) on your team's productivity. Extract commits from GitHub or GitLab, optionally score them with AI, and analyze before/after trends — all from within Claude Code.
 
+## Components
+
+| Type | Count |
+|------|-------|
+| Skills | 8 |
+| Python modules | 11 |
+| MCP Servers | 0 |
+
 ## Install
 
 ```bash
@@ -76,6 +84,13 @@ A local reverse mapping file (`.coding-productivity/developer_mapping.json`) all
 - The pseudonymization key and reverse mapping file together can deanonymize the dataset — store backups separately
 - Use fine-grained tokens with minimum required scopes (GitHub: Contents + PRs read; GitLab: `read_api`)
 - Commit diffs are sent to the Anthropic API when scoring is enabled — review their data usage policy for proprietary code
+
+## Known Issues
+
+- **DuckDB version lock-in**: DuckDB's storage format changes between minor versions. The plugin pins `duckdb~=1.2.0`. If you upgrade DuckDB and the database fails to open, delete `.coding-productivity/data.duckdb` and re-extract.
+- **Large repos (100K+ commits)**: In-memory SHA deduplication may use significant memory. For very large repos, consider extracting in date-range batches.
+- **Self-hosted GitLab with internal CAs**: Set `GITLAB_CA_BUNDLE` in config to your CA bundle path. The plugin never disables TLS verification.
+- **Cloud-synced directories**: If your project directory is synced (Dropbox, OneDrive, iCloud), the config file and mapping file will be synced too. Move to a non-synced directory if anonymization matters.
 
 ## License
 
