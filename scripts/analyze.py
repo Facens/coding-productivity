@@ -329,7 +329,15 @@ def merge_velocity(storage: Storage, config: Config,
     excl_clause, excl_params = _excluded_devs_filter(config)
 
     # Adapt filters for MR table aliases (m instead of c).
-    mr_repo_clause = repo_clause.replace("c.project_path", "m.project_name") if repo_clause else ""
+    # MR project_name stores short names (e.g., "admin"), not full paths
+    # (e.g., "team-blue-Hub/admin"). Rebuild repo params with short names.
+    if repo_clause:
+        mr_repo_params = {k: v.split("/")[-1] if "/" in v else v
+                          for k, v in repo_params.items()}
+        mr_repo_clause = repo_clause.replace("c.project_path", "m.project_name")
+        repo_params = mr_repo_params  # override for this query
+    else:
+        mr_repo_clause = ""
     mr_excl_clause = excl_clause.replace("c.author_email", "m.author_email") if excl_clause else ""
 
     clauses = ["m.created_at >= $since", "m.created_at < $until"]

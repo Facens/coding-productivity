@@ -99,7 +99,8 @@ class DuckDBStorage(Storage):
 
     def query(self, sql: str, params: Optional[dict] = None) -> list[dict[str, Any]]:
         if params:
-            result = self._conn.execute(sql, list(params.values()))
+            # DuckDB supports named $param placeholders with a dict directly
+            result = self._conn.execute(sql, params)
         else:
             result = self._conn.execute(sql)
         col_names = [desc[0] for desc in result.description]

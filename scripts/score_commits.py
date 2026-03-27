@@ -509,6 +509,18 @@ def score_commits(
     print(f"Found {len(commits):,} unscored commits.")
     print(f"Using {workers} parallel workers, batch size {batch_size}.")
 
+    # Pre-fetch all diffs from storage BEFORE starting the thread pool.
+    # DuckDB connections are not thread-safe, so all DB access must happen
+    # on the main thread.  Workers only make Claude API calls.
+    print("Pre-fetching diffs for all commits...", flush=True)
+    commit_diffs: dict[str, list[dict]] = {}
+    for i, c in enumerate(commits):
+        sha = c["commit_sha"]
+        commit_diffs[sha] = _fetch_diffs_for_commit(storage, sha)
+        if (i + 1) % 200 == 0:
+            print(f"  Pre-fetched diffs for {i + 1}/{len(commits)} commits", flush=True)
+    print(f"  Pre-fetched diffs for all {len(commits)} commits", flush=True)
+
     results: list[dict] = []
     batch_commit_rows: list[dict] = []
     batch_file_rows: list[dict] = []
@@ -518,7 +530,7 @@ def score_commits(
 
     def _process(commit: dict) -> dict | None:
         sha = commit["commit_sha"]
-        diffs = _fetch_diffs_for_commit(storage, sha)
+        diffs = commit_diffs.get(sha, [])
         if not diffs:
             return None
 

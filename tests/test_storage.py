@@ -44,7 +44,7 @@ class TestDuckDBStorageQuery:
     def test_query_with_params(self, duckdb_storage, sample_commits):
         duckdb_storage.insert_batch("commits", sample_commits)
         rows = duckdb_storage.query(
-            "SELECT commit_sha FROM commits WHERE additions > ?",
+            "SELECT commit_sha FROM commits WHERE additions > $min_additions",
             {"min_additions": 10},
         )
         assert len(rows) == 1
