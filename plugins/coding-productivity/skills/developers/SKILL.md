@@ -1,5 +1,5 @@
 ---
-name: developers
+name: coding-productivity:developers
 description: 'Manage the developer roster — review detected bots, find and merge duplicate identities, exclude developers from analysis. Use after extraction to clean up identity data.'
 ---
 

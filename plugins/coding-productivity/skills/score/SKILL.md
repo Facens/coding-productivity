@@ -1,5 +1,5 @@
 ---
-name: score
+name: coding-productivity:score
 description: 'Score commits using Claude Haiku to measure intellectual value and categorize changes. Use after extraction to add AI-powered productivity metrics. Requires an Anthropic API key.'
 ---
 
