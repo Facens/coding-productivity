@@ -39,7 +39,18 @@ Save the choice. If GitLab, also ask:
 
 ### Step 2: API Token
 
-Based on the platform choice, ask:
+First, check if the user already has a CLI tool authenticated:
+
+- **GitHub**: Run `gh auth token 2>/dev/null` via Bash. If it returns a token (non-empty, no error), offer to reuse it.
+- **GitLab**: Run `glab auth status 2>/dev/null` via Bash. If authenticated, run `glab config get token 2>/dev/null` to get the token.
+
+If a CLI token is found, ask:
+> Found an existing [gh/glab] CLI authentication. Use this token?
+>
+> 1. Yes, use the CLI token (Recommended)
+> 2. No, I'll provide a different token
+
+If no CLI token found, or user chooses to provide their own, ask:
 > Please paste your [GitHub/GitLab] API token.
 
 **Validate the token immediately** by calling the platform API:
