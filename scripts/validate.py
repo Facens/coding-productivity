@@ -14,6 +14,10 @@ Usage:
     python3 validate.py --config .coding-productivity.env \
         --reference reference.csv \
         --since 2026-01-01 --until 2026-01-31 --tolerance 0.05
+
+    python3 validate.py --config .coding-productivity.env \
+        --generate-reference .coding-productivity/reference-2026-03-27.json \
+        --since 2026-01-01 --until 2026-03-31
 """
 
 from __future__ import annotations
@@ -398,6 +402,58 @@ def format_summary(results: list[ComparisonResult]) -> str:
     return f"Validation: {counts['PASS']} PASS, {counts['OK']} OK, {counts['FAIL']} FAIL"
 
 
+# ── Reference generation ──────────────────────────────────────────────────────
+
+def _json_default(obj: Any) -> str:
+    """JSON serializer for objects not serializable by default."""
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    return str(obj)
+
+
+def generate_reference(config_path: str, output_path: str,
+                       since: str, until: str) -> str:
+    """Generate a reference snapshot from current plugin data.
+
+    Queries monthly_trends, author_productivity, and category_distribution,
+    then writes the combined result to *output_path* as JSON.
+
+    Returns the absolute path of the written file.
+    """
+    config = Config(config_path)
+    storage = get_storage(config)
+
+    try:
+        mt_rows = monthly_trends(storage, config, since, until)
+        ap_rows = author_productivity(storage, config, since, until)
+        cd_rows = category_distribution(storage, config, since, until)
+
+        reference = {
+            "period": {"since": since, "until": until},
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "monthly_trends": mt_rows,
+            "author_productivity": ap_rows,
+            "category_distribution": cd_rows,
+        }
+
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w") as f:
+            json.dump(reference, f, indent=2, default=_json_default)
+
+        row_counts = (
+            f"{len(mt_rows)} monthly trend rows, "
+            f"{len(ap_rows)} author productivity rows, "
+            f"{len(cd_rows)} category distribution rows"
+        )
+        print(f"Reference file saved to {out}")
+        print(f"Contains: {row_counts}")
+        return str(out.resolve())
+
+    finally:
+        storage.close()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def run_validation(config_path: str, reference_path: str,
@@ -473,7 +529,7 @@ def main():
         help="Path to .coding-productivity.env config file.",
     )
     parser.add_argument(
-        "--reference", required=True,
+        "--reference",
         help="Path to reference data file (CSV or JSON).",
     )
     parser.add_argument(
@@ -488,8 +544,33 @@ def main():
         "--tolerance", type=float, default=0.01,
         help="Tolerance for float metric comparisons (default: 0.01).",
     )
+    parser.add_argument(
+        "--generate-reference",
+        metavar="OUTPUT_PATH",
+        help="Generate a reference file from current data instead of validating.",
+    )
 
     args = parser.parse_args()
+
+    # Generate mode.
+    if args.generate_reference:
+        if not args.since or not args.until:
+            print("Error: --since and --until are required when generating a reference.",
+                  file=sys.stderr)
+            sys.exit(1)
+        generate_reference(
+            config_path=args.config,
+            output_path=args.generate_reference,
+            since=args.since,
+            until=args.until,
+        )
+        sys.exit(0)
+
+    # Validation mode.
+    if not args.reference:
+        print("Error: --reference is required (or use --generate-reference).",
+              file=sys.stderr)
+        sys.exit(1)
 
     _, exit_code = run_validation(
         config_path=args.config,

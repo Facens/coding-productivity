@@ -1,23 +1,25 @@
 ---
 name: validate
-description: 'Compare plugin analysis results against a reference dataset to verify correctness. Use after setting up a new instance to validate against known-good results.'
+description: 'Compare plugin analysis results against a reference dataset to verify correctness. Use to validate a new instance against known-good results, or generate a reference snapshot.'
 ---
 
 # Validation for coding-productivity
 
-This skill compares analysis output from the plugin against a reference dataset to verify that results are correct. It is useful after initial setup, after changing storage backends, or after re-extracting data.
+This skill compares analysis output from the plugin against a reference dataset to verify that results are correct. It can also generate a reference snapshot from current data. Useful after initial setup, after changing storage backends, or after re-extracting data.
 
 **Important:** Use `AskUserQuestion` for every interactive prompt. Never assume answers or skip steps.
+
+**No org-specific references.** Reference files are generated from each instance's own data. Do not bundle or distribute pre-built reference datasets tied to a specific organization.
 
 ## Step 1: Determine Mode
 
 Ask the user:
 > How would you like to validate?
 >
-> 1. **Generate a reference file** from current data (snapshot current results as the baseline)
+> 1. **Generate a reference snapshot** from current data (snapshot current results as the baseline)
 > 2. **Compare against an existing reference file** (verify current results match a known-good baseline)
 
-## Step 2a: Generate Reference File
+## Step 2a: Generate Reference Snapshot
 
 If the user chose to generate a reference file:
 
@@ -28,40 +30,21 @@ If the user chose to generate a reference file:
    > - **Since** (YYYY-MM-DD):
    > - **Until** (YYYY-MM-DD):
 
-3. Run all three analysis queries using `analyze.py` via Bash:
+3. Determine the output path. Use today's date:
    ```
-   python3.14 scripts/analyze.py --config .coding-productivity.env \
-       --query monthly_trends --since {since} --until {until} --format json
-   ```
-   ```
-   python3.14 scripts/analyze.py --config .coding-productivity.env \
-       --query author_productivity --since {since} --until {until} --format json
-   ```
-   ```
-   python3.14 scripts/analyze.py --config .coding-productivity.env \
-       --query category_distribution --since {since} --until {until} --format json
+   .coding-productivity/reference-YYYY-MM-DD.json
    ```
 
-4. Combine the three JSON outputs into a single reference file with this structure:
-   ```json
-   {
-     "period": {"since": "{since}", "until": "{until}"},
-     "generated_at": "{current ISO timestamp}",
-     "monthly_trends": [ ... ],
-     "author_productivity": [ ... ],
-     "category_distribution": [ ... ]
-   }
+4. Run the generation via Bash:
+   ```
+   python3.14 scripts/validate.py \
+       --config .coding-productivity.env \
+       --generate-reference .coding-productivity/reference-{today}.json \
+       --since {since} --until {until}
    ```
 
-5. Create the output directory if needed:
-   ```
-   mkdir -p .coding-productivity
-   ```
-
-6. Write the combined JSON to `.coding-productivity/reference-{YYYY-MM-DD}.json` using today's date.
-
-7. Display the result:
-   > Reference file saved to `.coding-productivity/reference-{date}.json`
+5. Display the result:
+   > Reference file saved to `.coding-productivity/reference-{today}.json`
    >
    > Contains:
    > - {N} monthly trend rows
