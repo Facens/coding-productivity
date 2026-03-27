@@ -1,356 +1,223 @@
 ---
 name: coding-productivity:setup
-description: 'Interactive configuration wizard for coding-productivity. Use when setting up the plugin for the first time, adding/removing repositories, changing storage backend, or toggling AI scoring. Re-runnable — safely modifies existing config without data loss.'
+description: 'Configure coding-productivity for your project. Auto-detects CLI tokens, selects repos, and writes .coding-productivity.env.'
 ---
 
-# Setup Wizard for coding-productivity
+# coding-productivity Setup
 
-This skill runs an interactive configuration wizard that creates or modifies `.coding-productivity.env`. It is safe to re-run at any time.
+## Interaction Method
 
-**Important:** Use `AskUserQuestion` for every interactive prompt. Never assume answers or skip steps.
+Ask the user each question below using the platform's blocking question tool (e.g., `AskUserQuestion` in Claude Code, `request_user_input` in Codex). If no structured question tool is available, present each question as a numbered list and wait for a reply before proceeding. Never skip or auto-configure.
 
-## Locate the Project Root
+## Step 1: Check Existing Config
 
-The project root is the directory containing `.coding-productivity.env` (for re-runs) or the current working directory (for fresh setup). All paths below are relative to this root.
-
-## Detect Fresh vs. Re-run
-
-1. Use the Read tool to attempt reading `.coding-productivity.env` in the project root.
-2. If the file exists and contains config values, this is a **re-run** — jump to the Re-run Flow.
-3. If the file does not exist or is empty, this is a **fresh setup** — proceed with the Fresh Setup Flow.
-
----
-
-## Fresh Setup Flow
-
-Execute these steps in order. Use `AskUserQuestion` for each prompt.
-
-### Step 1: Platform
-
-Ask the user:
-> Which Git platform do you use?
->
-> 1. GitHub
-> 2. GitLab
-
-Save the choice. If GitLab, also ask:
-- **GitLab URL** (e.g., `https://gitlab.example.com`) — required for self-hosted instances
-- **Custom CA bundle path** (optional) — only if they have a self-hosted GitLab with a custom certificate
-
-### Step 2: API Token
-
-**MANDATORY FIRST ACTION — you MUST run this Bash command before showing any token prompt to the user. Do NOT skip this step.**
-
-For GitHub, run this exact command via the Bash tool:
-```
-python3 "$(find ~/.claude/plugins -path '*/coding-productivity/scripts/detect_token.py' 2>/dev/null | head -1)" github
-```
-
-For GitLab, run this exact command via the Bash tool:
-```
-python3 "$(find ~/.claude/plugins -path '*/coding-productivity/scripts/detect_token.py' 2>/dev/null | head -1)" gitlab --url GITLAB_URL
-```
-
-Check the exit code.
-
-**If exit code is 0** (token found — printed to stdout):
-- Store the token value
-- Ask the user via AskUserQuestion:
-  - Question: "Found an existing CLI authentication. Use this token?"
-  - Option 1: "Yes, use the detected token (Recommended)"
-  - Option 2: "No, I'll provide a different token"
-- If the user picks option 1, use the detected token and skip to Step 3.
-
-**If exit code is 1** (no token found), or user picked option 2, ask:
-> Please paste your GitHub/GitLab API token.
-
-**Validate the token immediately** by calling the platform API:
-
-- **GitHub**: Run via Bash:
-  ```
-  curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer TOKEN" https://api.github.com/user/repos?per_page=1
-  ```
-  A `200` response means the token is valid. Any other code means failure.
-
-- **GitLab**: Run via Bash:
-  ```
-  curl -s -o /dev/null -w "%{http_code}" -H "PRIVATE-TOKEN: TOKEN" GITLAB_URL/api/v4/projects?membership=true&per_page=1
-  ```
-  A `200` response means the token is valid.
-
-**On failure**, display the error and explain the required scopes:
-- **GitHub**: Needs `repo` scope (classic token) or a fine-grained token with Contents + Pull Requests read access. Create one at: `https://github.com/settings/tokens`
-- **GitLab**: Needs `read_api` scope. Link: `GITLAB_URL/-/user_settings/personal_access_tokens`
-
-Ask the user to try again. Do not proceed until validation succeeds.
-
-### Step 3: Repository Selection
-
-After token validation, fetch the full list of accessible repositories:
-
-- **GitHub**: `curl -s -H "Authorization: Bearer TOKEN" "https://api.github.com/user/repos?per_page=100&type=all"` — paginate if needed, extract `full_name` from each repo.
-- **GitLab**: `curl -s -H "PRIVATE-TOKEN: TOKEN" "GITLAB_URL/api/v4/projects?membership=true&per_page=100"` — paginate if needed, extract `path_with_namespace` from each repo.
-
-Present the list to the user as a multi-select with a "Select all" option at the top:
-
-> Which repositories should be tracked? (comma-separated numbers, or "all")
->
-> 0. Select all
-> 1. org/repo-one
-> 2. org/repo-two
-> ...
-
-Save the selected repos as a comma-separated list for the `REPOS` config key.
-
-### Step 4: Storage Backend
-
-Ask:
-> Which storage backend?
->
-> 1. DuckDB (Recommended, default) — local file, zero setup
-> 2. BigQuery — cloud-based, for large-scale analysis
-
-If **DuckDB** (default): set `STORAGE_BACKEND=duckdb` and `DB_PATH=.coding-productivity/data.duckdb`.
-
-If **BigQuery**: ask for:
-- GCP Project ID
-- BigQuery Dataset name
-- Path to service account JSON file (validate the file exists using Read tool)
-
-Set `STORAGE_BACKEND=bigquery` and the corresponding `GCP_PROJECT_ID`, `BQ_DATASET`, `GOOGLE_APPLICATION_CREDENTIALS`.
-
-### Step 5: Anonymization
-
-Ask:
-> Enable developer identity anonymization?
->
-> 1. Yes (Recommended, default) — developer emails are hashed; real identities stored in a separate mapping file
-> 2. No — developer emails stored as-is in the dataset
-
-If **Yes**:
-- Generate a pseudonymization salt via Bash: `python3.14 -c "import secrets; print(secrets.token_hex(32))"`
-- Save the output as `PSEUDONYMIZATION_KEY`
-- Set `ANONYMIZATION_ENABLED=true`
-- Display this warning prominently (use bold/caps):
-
-> **WARNING: Your pseudonymization key has been generated. BACK IT UP. Losing it means existing hashes become permanently unresolvable. Store a copy somewhere safe outside this project.**
-
-If **No**: set `ANONYMIZATION_ENABLED=false`.
-
-### Step 6: AI Scoring
-
-Ask:
-> Enable AI-powered commit scoring? This uses the Anthropic API to evaluate commit quality and assign scores.
->
-> 1. No (default) — skip AI scoring
-> 2. Yes — enable AI-powered commit quality scoring
-
-If **Yes**:
-- Ask for the Anthropic API key
-- Validate by calling: `curl -s -o /dev/null -w "%{http_code}" -H "x-api-key: KEY" -H "anthropic-version: 2023-06-01" https://api.anthropic.com/v1/models`
-- A `200` response means valid. On failure, show the error and ask to retry.
-- Set `SCORING_ENABLED=true` and `ANTHROPIC_API_KEY`
-
-If **No**: set `SCORING_ENABLED=false`.
-
-### Step 7: Summary & Confirmation
-
-Display a formatted summary of ALL configuration:
+Read `.coding-productivity.env` in the current directory. If it exists, display current settings (mask tokens: show only last 4 chars) and ask:
 
 ```
-=== coding-productivity Configuration Summary ===
+Settings file already exists. What would you like to do?
 
-Platform:       GitHub
-Token:          ghp_****...****(last 4)   [validated]
-Repositories:   3 selected
-                - org/repo-one
-                - org/repo-two
-                - org/repo-three
-Storage:        DuckDB (.coding-productivity/data.duckdb)
-Anonymization:  Enabled (key generated)
-AI Scoring:     Disabled
-
-===================================================
+1. Reconfigure - Run setup again from scratch
+2. Modify a section - Change repos, storage, scoring, etc.
+3. View current - Show the file contents, then stop
+4. Cancel - Keep current settings
 ```
 
-**Always mask tokens** — show only the last 4 characters.
+If "View current": read and display the file (mask tokens), then stop.
+If "Cancel": stop.
+If "Modify a section": jump to Re-run Flow below.
 
-Ask:
-> Does this look correct? Save configuration?
->
-> 1. Yes, save it
-> 2. No, let me start over
+## Step 2: Detect Platform and Token
 
-If "No", restart from Step 1.
+Auto-detect existing CLI authentication by running this via Bash:
 
-### Step 8: Write Configuration
+```bash
+gh auth token 2>/dev/null && echo "PLATFORM=github" || glab config get token 2>/dev/null && echo "PLATFORM=gitlab" || echo "NONE"
+```
 
-Write the config to `.coding-productivity.env` using the Write tool. Use the following template, filling in the collected values:
+**If a token is detected**, ask:
+
+```
+Found existing CLI authentication ({platform}). How would you like to proceed?
+
+1. Use detected token (Recommended) - No manual setup needed
+2. Use a different platform or token - I'll provide one manually
+```
+
+If option 1: store the token and detected platform. Skip to Step 3.
+
+**If no token detected**, or user chose option 2, ask:
+
+```
+Which Git platform do you use?
+
+1. GitHub
+2. GitLab
+```
+
+If GitLab, also ask for GitLab URL (for self-hosted instances).
+
+Then ask the user to paste their API token. Validate it by running via Bash:
+
+- **GitHub**: `curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer TOKEN" https://api.github.com/user/repos?per_page=1`
+- **GitLab**: `curl -s -o /dev/null -w "%{http_code}" -H "PRIVATE-TOKEN: TOKEN" GITLAB_URL/api/v4/projects?membership=true&per_page=1`
+
+A `200` means valid. On failure, explain:
+- **GitHub**: needs `repo` scope. Create at: https://github.com/settings/tokens
+- **GitLab**: needs `read_api` scope.
+
+Retry until validation succeeds.
+
+## Step 3: Repository Selection
+
+Fetch the full list of accessible repositories using the validated token:
+
+- **GitHub**: `curl -s -H "Authorization: Bearer TOKEN" "https://api.github.com/user/repos?per_page=100&type=all"` — extract `full_name`
+- **GitLab**: `curl -s -H "PRIVATE-TOKEN: TOKEN" "GITLAB_URL/api/v4/projects?membership=true&per_page=100"` — extract `path_with_namespace`
+
+Paginate if needed (follow Link headers).
+
+Present as a multi-select:
+
+```
+Which repositories should be tracked? (comma-separated numbers, or "all")
+
+0. Select all
+1. org/repo-one
+2. org/repo-two
+...
+```
+
+## Step 4: Configure Options
+
+Ask three quick questions:
+
+**a. Storage:**
+
+```
+Storage backend?
+
+1. DuckDB (Recommended) - Local file, zero cloud setup
+2. BigQuery - Requires GCP project and service account
+```
+
+If BigQuery: ask for GCP Project ID, Dataset name, path to service account JSON.
+
+**b. Anonymization:**
+
+```
+Anonymize developer identities?
+
+1. Yes (Recommended) - Emails are hashed, real names stored separately
+2. No - Emails stored as-is
+```
+
+If Yes: generate a key via Bash: `python3 -c "import secrets; print(secrets.token_hex(32))"`
+
+**c. AI Scoring:**
+
+```
+Enable AI commit scoring? (uses Anthropic API, costs ~$0.001/commit)
+
+1. No (default) - Raw metrics only
+2. Yes - Score each commit's intellectual value with Claude Haiku
+```
+
+If Yes: ask for Anthropic API key, validate with curl.
+
+## Step 5: Write Config and Confirm
+
+Write `.coding-productivity.env` using the Write tool:
 
 ```
 # coding-productivity configuration
 # Created by /coding-productivity:setup
-# Keep this file private — it contains API tokens and the pseudonymization key.
 # NEVER commit this file to version control.
 
-# ─── Platform & Authentication ───────────────────────────────────────
 PLATFORM={platform}
 GITHUB_TOKEN={github_token}
 GITLAB_TOKEN={gitlab_token}
 GITLAB_URL={gitlab_url}
-GITLAB_CA_BUNDLE={gitlab_ca_bundle}
+GITLAB_CA_BUNDLE=
 
-# ─── Repositories ────────────────────────────────────────────────────
 REPOS={repos_comma_separated}
 
-# ─── Storage ─────────────────────────────────────────────────────────
 STORAGE_BACKEND={storage_backend}
 STORAGE_MODE=readwrite
-DB_PATH={db_path}
+DB_PATH=.coding-productivity/data.duckdb
 GCP_PROJECT_ID={gcp_project_id}
 BQ_DATASET={bq_dataset}
 GOOGLE_APPLICATION_CREDENTIALS={google_creds_path}
 
-# ─── AI Scoring (optional) ───────────────────────────────────────────
-SCORING_ENABLED={scoring_enabled}
-ANTHROPIC_API_KEY={anthropic_api_key}
+SCORING_ENABLED={true_or_false}
+ANTHROPIC_API_KEY={anthropic_key}
 
-# ─── Anonymization ───────────────────────────────────────────────────
-ANONYMIZATION_ENABLED={anonymization_enabled}
-PSEUDONYMIZATION_KEY={pseudonymization_key}
+ANONYMIZATION_ENABLED={true_or_false}
+PSEUDONYMIZATION_KEY={key_or_empty}
 
-# ─── Developer Management ────────────────────────────────────────────
 EXCLUDED_DEVELOPERS=
 BOT_OVERRIDES=
 IDENTITY_MERGES=
 ```
 
-Leave keys blank (not omitted) when they are not applicable to the chosen configuration.
+Leave keys blank when not applicable. Then run via Bash:
 
-After writing, set permissions via Bash:
-```
+```bash
 chmod 600 .coding-productivity.env
 ```
 
-### Step 9: Update .gitignore
-
-Read `.gitignore` in the project root (create it if it does not exist). Ensure these entries are present — add any that are missing:
-
+Add to `.gitignore` (create if needed):
 ```
 .coding-productivity.env
 .coding-productivity/
 developer_mapping.json
 ```
 
-Do not duplicate entries that already exist.
+Display summary (mask tokens) and warnings:
 
-### Step 10: Bootstrap Python Environment
-
-Run via Bash:
 ```
-python3.14 scripts/setup_env.py
+Saved to .coding-productivity.env
+
+Platform:       {platform}
+Token:          ****{last4}  [validated]
+Repositories:   {count} selected
+Storage:        {backend}
+Anonymization:  {Enabled/Disabled}
+AI Scoring:     {Enabled/Disabled}
 ```
 
-Report the output to the user. If it fails, show the error and suggest troubleshooting steps.
+If anonymization enabled:
+> **Back up your pseudonymization key.** Losing it means existing hashes become permanently unresolvable.
 
-### Step 11: Offer Next Step
+Then:
 
-Display the security warnings:
+```
+Setup complete. What next?
 
-> **Security reminder:** Your config file contains API tokens. Do not place this project in a cloud-synced directory if security matters.
-
-If anonymization is enabled, also display:
-
-> **Anonymization notice:** The pseudonymization key and developer mapping file together can deanonymize the dataset. Store backups of these files separately.
-
-Then ask:
-> Setup complete. Would you like to extract data now?
->
-> 1. Yes, run /coding-productivity:extract
-> 2. No, I will do it later
-
-If "Yes", tell the user to run `/coding-productivity:extract`.
+1. Run /coding-productivity:extract - Start pulling commit data
+2. Done for now
+```
 
 ---
 
-## Re-run Flow
+## Re-run Flow (Modify a Section)
 
-When `.coding-productivity.env` already exists:
+When the user chose "Modify a section" in Step 1:
 
-### Step 1: Load and Display Current Config
+```
+Which section would you like to modify?
 
-Read `.coding-productivity.env` and parse all values. Display a summary identical to the format in Fresh Setup Step 7, with tokens masked.
+1. Platform & Token
+2. Repositories
+3. Storage Backend
+4. Anonymization
+5. AI Scoring
+6. Done - exit
+```
 
-### Step 2: Section Selection
+For each section, re-run the corresponding step from above. Important edge cases:
 
-Ask:
-> Which section would you like to modify?
->
-> 1. Platform & Authentication
-> 2. Repositories
-> 3. Storage Backend
-> 4. Anonymization
-> 5. AI Scoring
-> 6. Everything looks good — exit
+- **Anonymization**: Check if data exists first (`count commits in storage`). If commits > 0, display as **locked**: "Cannot change while data exists. Delete .coding-productivity/data.duckdb and re-extract to change."
+- **Storage backend switch**: Warn "Switching does not migrate data. You'll need to re-extract."
+- **Repo removal**: "Removing a repo does not delete existing data. Analysis filters by active repos."
 
-### Step 3: Handle Each Section
-
-#### Platform & Authentication (option 1)
-- Show current platform and token (masked)
-- Run the same flow as Fresh Setup Steps 1-2
-- After changing, also re-run Repository Selection (Step 3 of fresh) since repos depend on the token
-
-#### Repositories (option 2)
-- Show currently configured repos
-- Fetch the full repo list using the existing token
-- Present the multi-select as in Fresh Setup Step 3
-- Pre-select currently configured repos
-- **If repos are removed**, inform the user:
-  > "Removing a repo does not delete existing data. Analysis will simply filter by active repos."
-- **If repos are added**, inform the user:
-  > "New repos will be included on the next run of /coding-productivity:extract."
-
-#### Storage Backend (option 3)
-- Show current backend
-- If changing from one backend to another, display a warning:
-  > **Warning:** Switching backend does not migrate data. Your existing data remains as a backup in the previous backend. You will need to re-extract.
-- Run the same flow as Fresh Setup Step 4
-
-#### Anonymization (option 4)
-- **Check if data exists first.** Run via Bash:
-  ```
-  python3.14 -c "
-  from scripts.lib.config import Config
-  from scripts.lib.storage import Storage
-  cfg = Config()
-  st = Storage(cfg)
-  print(st.count('commits'))
-  "
-  ```
-- **If commit count > 0**, display as READ-ONLY:
-  > **Anonymization: Locked**
-  > Anonymization settings cannot be changed while data exists ({count} commits in storage). To change anonymization settings, delete the data file (`.coding-productivity/data.duckdb` for DuckDB) and re-extract.
-  >
-  > Current setting: {Enabled/Disabled}
-  > Key: {masked}
-
-  Do NOT allow changes. Return to section selection.
-
-- **If no data exists**, run the same flow as Fresh Setup Step 5. If changing from disabled to enabled, generate a new key. If changing from enabled to disabled, warn that the existing key will be removed from config (but not deleted from backups).
-
-#### AI Scoring (option 5)
-- Show current setting
-- Run the same flow as Fresh Setup Step 6
-
-### Step 4: Save and Confirm
-
-After modifying any section:
-1. Write the updated config to `.coding-productivity.env` (preserving all other values)
-2. Set `chmod 600`
-3. Show the updated summary
-4. Return to section selection (Step 2) so the user can modify additional sections or exit
-
-### Exiting Re-run
-
-When the user selects "Everything looks good", display:
-> Configuration saved. Run `/coding-productivity:extract` to pull data with the updated settings.
+After each modification, save config, show updated summary, and return to section selection.
