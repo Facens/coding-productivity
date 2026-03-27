@@ -114,20 +114,34 @@ def _extract_commits(
         existing_shas = set()
 
     print(f"[{repo}] {len(existing_shas):,} existing commits in storage", flush=True)
-    print(f"[{repo}] Fetching commit list...", flush=True)
 
-    # Collect commit stubs from the API.
-    raw_commits: list[dict] = []
+    # Fetch all branches and extract commits across all of them (matching
+    # the multi-branch extraction pattern from the original pipeline).
+    print(f"[{repo}] Fetching branches...", flush=True)
     try:
-        for c in client.get_commits(repo, since=since, until=until):
-            raw_commits.append(c)
-    except Exception as exc:
-        print(f"[{repo}] Error fetching commits: {exc}", flush=True)
-        return 0
+        branches = client.get_branches(repo)
+    except Exception:
+        branches = ["main"]  # fallback
+    print(f"[{repo}] {len(branches)} branches found", flush=True)
+
+    # Collect commit stubs from all branches, deduplicating by SHA across branches.
+    raw_commits: list[dict] = []
+    seen_shas: set[str] = set()
+    for branch in branches:
+        try:
+            for c in client.get_commits(repo, since=since, until=until, sha=branch):
+                if c["sha"] not in seen_shas:
+                    seen_shas.add(c["sha"])
+                    c["_branch"] = branch  # track source branch
+                    raw_commits.append(c)
+        except Exception as exc:
+            print(f"[{repo}] Error on branch {branch}: {exc}", flush=True)
+            continue
 
     if not raw_commits:
         print(f"[{repo}] No commits in date range", flush=True)
         return 0
+    print(f"[{repo}] {len(raw_commits)} unique commits across {len(branches)} branches", flush=True)
 
     # Determine where to resume.
     resume_after: Optional[str] = None
@@ -186,7 +200,7 @@ def _extract_commits(
             "authored_date": authored_date,
             "committed_date": committed_date,
             "created_at": authored_date,
-            "branch_name": None,
+            "branch_name": commit_stub.get("_branch"),
             "title": git_commit.get("message", "").split("\n")[0][:255],
             "message": git_commit.get("message", "")[:5000],
             "additions": stats.get("additions", 0),

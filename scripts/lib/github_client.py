@@ -180,18 +180,35 @@ class GitHubClient:
         print(f"  Found {len(repos)} repos", flush=True)
         return repos
 
+    def get_branches(self, repo: str) -> list[str]:
+        """Return all branch names for *repo* (``owner/name``)."""
+        branches = []
+        for branch in self._paginate(f"/repos/{repo}/branches"):
+            branches.append(branch["name"])
+        return branches
+
     def get_commits(
         self,
         repo: str,
         since: str | None = None,
         until: str | None = None,
+        sha: str | None = None,
     ) -> Generator[dict, None, None]:
-        """Yield commits for *repo* (``owner/name``), optionally date-filtered."""
+        """Yield commits for *repo* (``owner/name``), optionally date-filtered.
+
+        Parameters
+        ----------
+        sha:
+            Branch name or commit SHA to list commits from. Defaults to the
+            repo's default branch when omitted.
+        """
         params: dict = {}
         if since:
             params["since"] = f"{since}T00:00:00Z"
         if until:
             params["until"] = f"{until}T23:59:59Z"
+        if sha:
+            params["sha"] = sha
 
         for commit in self._paginate(f"/repos/{repo}/commits", params):
             yield commit
