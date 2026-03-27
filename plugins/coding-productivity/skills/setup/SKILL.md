@@ -39,23 +39,19 @@ Save the choice. If GitLab, also ask:
 
 ### Step 2: API Token
 
-**MANDATORY FIRST ACTION — run this before showing any prompt to the user.**
+**MANDATORY FIRST ACTION — you MUST run this Bash command before showing any token prompt to the user. Do NOT skip this step.**
 
-First, find the plugin's scripts directory:
+For GitHub, run this exact command via the Bash tool:
 ```
-find ~/.claude/plugins -path "*/coding-productivity/scripts/detect_token.py" 2>/dev/null | head -1
-```
-
-Then run the token detection script using the found path:
-```
-python3 /path/to/detect_token.py github
-```
-or for GitLab:
-```
-python3 /path/to/detect_token.py gitlab --url GITLAB_URL
+python3 "$(find ~/.claude/plugins -path '*/coding-productivity/scripts/detect_token.py' 2>/dev/null | head -1)" github
 ```
 
-Use the Bash tool for both commands. Check the exit code of the second command.
+For GitLab, run this exact command via the Bash tool:
+```
+python3 "$(find ~/.claude/plugins -path '*/coding-productivity/scripts/detect_token.py' 2>/dev/null | head -1)" gitlab --url GITLAB_URL
+```
+
+Check the exit code.
 
 **If exit code is 0** (token found — printed to stdout):
 - Store the token value
