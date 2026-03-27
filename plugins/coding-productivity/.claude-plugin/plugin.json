@@ -1,6 +1,6 @@
 {
   "name": "coding-productivity",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Measure AI coding tool impact with commit-level extraction, optional AI scoring, and productivity analysis for GitHub and GitLab codebases. 8 Skills.",
   "author": {
     "name": "Facens",
