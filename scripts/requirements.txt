@@ -1,0 +1,9 @@
+# Core dependencies
+duckdb~=1.2.0
+filelock
+requests
+python-dotenv
+
+# Optional extras (install manually if needed):
+#   google-cloud-bigquery   — BigQuery storage backend
+#   anthropic               — AI-powered commit scoring

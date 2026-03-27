@@ -1,0 +1,23 @@
+{
+  "name": "coding-productivity",
+  "version": "0.1.0",
+  "description": "Measure AI coding tool impact with commit-level extraction, optional AI scoring, and productivity analysis for GitHub and GitLab codebases. 8 Skills.",
+  "author": {
+    "name": "Facens",
+    "url": "https://github.com/Facens"
+  },
+  "homepage": "https://github.com/Facens/coding-productivity",
+  "repository": "https://github.com/Facens/coding-productivity",
+  "license": "CC-BY-NC-4.0",
+  "keywords": [
+    "productivity",
+    "ai-tools",
+    "github",
+    "gitlab",
+    "commit-analysis",
+    "developer-metrics",
+    "duckdb",
+    "bigquery",
+    "anonymization"
+  ]
+}
