@@ -1,5 +1,5 @@
 ---
-name: coding-productivity:setup
+name: setup
 description: 'Interactive configuration wizard for coding-productivity. Use when setting up the plugin for the first time, adding/removing repositories, changing storage backend, or toggling AI scoring. Re-runnable — safely modifies existing config without data loss.'
 ---
 
