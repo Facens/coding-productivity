@@ -133,6 +133,28 @@ def setup() -> Path:
     else:
         print(f"WARNING: {REQUIREMENTS} not found, skipping dependency install.")
 
+    # Install optional extras based on config (if a config file exists nearby).
+    config_candidates = [
+        Path.cwd() / ".coding-productivity.env",
+        PLUGIN_ROOT / ".coding-productivity.env",
+    ]
+    for cfg_path in config_candidates:
+        if cfg_path.exists():
+            cfg_text = cfg_path.read_text()
+            if "SCORING_ENABLED=true" in cfg_text:
+                print("Installing anthropic (scoring enabled)...")
+                subprocess.check_call(
+                    [vpy, "-m", "pip", "install", "anthropic"],
+                    stdout=subprocess.DEVNULL,
+                )
+            if "STORAGE_BACKEND=bigquery" in cfg_text:
+                print("Installing google-cloud-bigquery (BigQuery backend)...")
+                subprocess.check_call(
+                    [vpy, "-m", "pip", "install", "google-cloud-bigquery"],
+                    stdout=subprocess.DEVNULL,
+                )
+            break
+
     print(f"\nSetup complete. Venv Python: {vpy}")
     return Path(vpy)
 
