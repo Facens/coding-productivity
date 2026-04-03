@@ -263,19 +263,16 @@ def _extract_diffs(
 
     slug = repo.replace("/", "_")
 
-    # Determine which SHAs already have diffs.
+    # Get commit SHAs for THIS repo that do NOT yet have diffs.
     try:
-        existing_diff_shas = storage.get_existing_shas("diffs")
+        rows = storage.query(
+            "SELECT commit_sha FROM commits WHERE project_path = $repo "
+            "AND commit_sha NOT IN (SELECT commit_sha FROM diffs)",
+            {"repo": repo},
+        )
+        need_diffs = {r["commit_sha"] for r in rows}
     except Exception:
-        existing_diff_shas = set()
-
-    # Get commit SHAs from the commits table that do NOT yet have diffs.
-    try:
-        commit_shas_in_storage = storage.get_existing_shas("commits")
-    except Exception:
-        commit_shas_in_storage = set()
-
-    need_diffs = commit_shas_in_storage - existing_diff_shas
+        need_diffs = set()
     if not need_diffs:
         print(f"[{repo}] No new diffs to extract", flush=True)
         return 0
