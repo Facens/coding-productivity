@@ -11,7 +11,6 @@ skills/          # User-facing skills (SKILL.md files)
 scripts/         # Python backend scripts
 scripts/lib/     # Shared Python modules
 references/      # Bundled assets (scoring prompt, example config)
-docs/solutions/  # Documented solutions to past problems, organized by category with YAML frontmatter (module, tags, problem_type)
 ```
 
 ## Conventions
