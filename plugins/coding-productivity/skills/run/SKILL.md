@@ -6,19 +6,19 @@ argument-hint: '[date range, e.g. "January 2026", "last 3 months", "2025-06 to 2
 
 # Run Full Pipeline
 
-Run extract → score (if enabled) → analyze → report in sequence for a given time period.
+Run extract -> score (if enabled) -> analyze -> report in sequence for a given time period.
 
 ## Step 1: Parse Date Range
 
 The user may provide a date range as an argument. Parse it into `--since` and `--until` dates (YYYY-MM-DD format).
 
 Examples:
-- `January 2026` → `--since 2026-01-01 --until 2026-02-01`
-- `Feb 2026` → `--since 2026-02-01 --until 2026-03-01`
-- `2025-06 to 2025-12` → `--since 2025-06-01 --until 2025-12-31`
-- `last 3 months` → compute from today's date
-- `Q1 2026` → `--since 2026-01-01 --until 2026-04-01`
-- No argument → default to last calendar month
+- `January 2026` -> `--since 2026-01-01 --until 2026-02-01`
+- `Feb 2026` -> `--since 2026-02-01 --until 2026-03-01`
+- `2025-06 to 2025-12` -> `--since 2025-06-01 --until 2025-12-31`
+- `last 3 months` -> compute from today's date
+- `Q1 2026` -> `--since 2026-01-01 --until 2026-04-01`
+- No argument -> default to last calendar month
 
 If the date range is ambiguous, ask the user to clarify.
 
@@ -40,7 +40,7 @@ find ~/.claude/plugins -path '*/coding-productivity/scripts/extract_github.py' 2
 
 Determine platform from config (`PLATFORM` key).
 
-Extraction is **incremental by default** — the scripts auto-detect the latest commit timestamp in storage and only fetch newer data. When the user provides a date range, pass `--since`/`--until` to scope the extraction.
+Extraction is **incremental by default** -- the scripts auto-detect the latest commit timestamp in storage and only fetch newer data. When the user provides a date range, pass `--since`/`--until` to scope the extraction.
 
 For GitHub:
 ```bash
@@ -90,10 +90,10 @@ After all steps complete, display:
 Pipeline complete for {date_range}.
 
 Extraction:  {commit_count} commits from {repo_count} repos
-Scoring:     {scored_count} commits scored (or "Skipped — not enabled")
+Scoring:     {scored_count} commits scored (or "Skipped -- not enabled")
 Analysis:    4 reports generated
 
 Next steps:
-- /coding-productivity:report {date_range} — Generate executive summary document
-- /coding-productivity:developers — Review and clean up developer identities
+- /coding-productivity:report {date_range} -- Generate executive summary document
+- /coding-productivity:developers -- Review and clean up developer identities
 ```
