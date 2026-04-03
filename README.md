@@ -13,13 +13,19 @@ In Claude Code:
 ## Quick Start
 
 ```
-/coding-productivity:setup              # Configure platform, repos, storage
-/coding-productivity:run March 2026     # Extract → score → analyze in one step
+/coding-productivity:setup                      # Configure platform, repos, storage
+/coding-productivity:run                        # Last month (default)
+/coding-productivity:run March 2026             # Specific month
+/coding-productivity:run Q1 2026                # Quarter
+/coding-productivity:run 2025-06 to 2025-12     # Custom range
+/coding-productivity:run last 3 months          # Relative
 ```
+
+`run` extracts → scores (if enabled) → analyzes in one step. Default is last calendar month.
 
 Or run each step individually:
 ```
-/coding-productivity:extract    # Pull commits, diffs, and PRs (incremental by default)
+/coding-productivity:extract    # Pull new commits (incremental by default)
 /coding-productivity:score      # AI-score commits via Claude Haiku
 /coding-productivity:analyze    # View productivity trends and metrics
 /coding-productivity:report     # Generate executive summary markdown
