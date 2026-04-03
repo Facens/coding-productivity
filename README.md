@@ -13,14 +13,15 @@ In Claude Code:
 ## Quick Start
 
 ```
-/coding-productivity:setup      # Configure platform, repos, storage
-/coding-productivity:extract    # Pull commits, diffs, and PRs
-/coding-productivity:analyze    # View productivity trends and metrics
+/coding-productivity:setup              # Configure platform, repos, storage
+/coding-productivity:run March 2026     # Extract → score → analyze in one step
 ```
 
-Optional:
+Or run each step individually:
 ```
+/coding-productivity:extract    # Pull commits, diffs, and PRs (incremental by default)
 /coding-productivity:score      # AI-score commits via Claude Haiku
+/coding-productivity:analyze    # View productivity trends and metrics
 /coding-productivity:report     # Generate executive summary markdown
 ```
 
