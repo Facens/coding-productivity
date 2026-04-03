@@ -21,14 +21,15 @@ In Claude Code:
 ## Quick Start
 
 ```
-/coding-productivity:setup      # Configure platform, repos, storage
-/coding-productivity:extract    # Pull commits, diffs, and PRs
-/coding-productivity:analyze    # View productivity trends and metrics
+/coding-productivity:setup              # Configure platform, repos, storage
+/coding-productivity:run March 2026     # Extract → score → analyze in one step
 ```
 
-Optional:
+Or run each step individually:
 ```
+/coding-productivity:extract    # Pull commits, diffs, and PRs
 /coding-productivity:score      # AI-score commits via Claude Haiku
+/coding-productivity:analyze    # View productivity trends and metrics
 /coding-productivity:report     # Generate executive summary markdown
 ```
 
@@ -39,6 +40,7 @@ Optional:
 - **AI scoring (optional)** — Claude Haiku evaluates each commit's intellectual value (0.0-1.0).
 - **Identity management** — Bot detection, duplicate identity merging, developer exclusions.
 - **Anonymization** — HMAC-SHA256 hashing of developer identities, on by default.
+- **Incremental by default** — Re-runs fetch only new commits since the last extraction. Use `--full` to force a complete re-extraction.
 - **Resumable** — Extraction checkpoints, rate-limit handling with pause/resume.
 - **Re-runnable setup** — Add repos, toggle features, change config at any time.
 

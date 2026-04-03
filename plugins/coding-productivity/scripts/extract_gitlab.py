@@ -570,13 +570,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--since",
-        required=True,
-        help="Start date (YYYY-MM-DD).",
+        help="Start date (YYYY-MM-DD or ISO 8601).  "
+             "Defaults to the latest commit in storage (incremental).",
     )
     parser.add_argument(
         "--until",
-        required=True,
         help="End date (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--full", action="store_true",
+        help="Force full extraction (ignore existing data, fetch all history).",
     )
     parser.add_argument(
         "--batch-size",
@@ -591,6 +594,27 @@ def main() -> None:
     if errors:
         for e in errors:
             print(f"Config error: {e}", flush=True)
+        sys.exit(1)
+
+    # ── Auto-since (incremental by default) ─────────────────────────
+    if not args.since and not args.full:
+        from lib.storage import get_storage
+        try:
+            st = get_storage(config)
+            rows = st.query("SELECT MAX(committed_date) AS latest FROM commits")
+            latest = rows[0].get("latest") if rows else None
+            st.close()
+            if latest:
+                from datetime import datetime, timezone
+                dt = datetime.fromisoformat(str(latest).replace("Z", "+00:00"))
+                args.since = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                print(f"  Auto-since:  {args.since} (latest commit in storage)", flush=True)
+        except Exception:
+            pass  # empty DB — will need explicit dates or --full
+
+    if not args.since and not args.full:
+        print("Error: No existing data found. Provide --since/--until or use --full for first extraction.",
+              file=sys.stderr)
         sys.exit(1)
 
     try:

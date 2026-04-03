@@ -57,16 +57,20 @@ Read the `PLATFORM` value from `.coding-productivity.env`. It will be either `gi
 
 ## Step 5: Run Extraction
 
+Extraction is **incremental by default** — the scripts auto-detect the latest commit timestamp in storage and only fetch newer data. On first run (empty database), all history is fetched.
+
+If the user explicitly provides a date range (e.g., `/coding-productivity:extract February 2026`), parse it and pass `--since`/`--until`. If the user asks for a full re-extraction, add `--full`.
+
 Based on the platform, run the appropriate extraction script via Bash.
 
 **GitHub:**
 ```
-scripts/.venv/bin/python3.14 scripts/extract_github.py --config .coding-productivity.env
+scripts/.venv/bin/python3.14 scripts/extract_github.py --config .coding-productivity.env [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--full]
 ```
 
 **GitLab:**
 ```
-scripts/.venv/bin/python3.14 scripts/extract_gitlab.py --config .coding-productivity.env
+scripts/.venv/bin/python3.14 scripts/extract_gitlab.py --config .coding-productivity.env [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--full]
 ```
 
 The scripts print progress to stdout. Display this output to the user as it runs. If the script exits with a non-zero code, display the error and stop.

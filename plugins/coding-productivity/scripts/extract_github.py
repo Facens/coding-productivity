@@ -614,11 +614,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--since",
-        help="Start date for extraction (YYYY-MM-DD).",
+        help="Start date for extraction (YYYY-MM-DD).  "
+             "Defaults to 1 day before the latest commit in storage (incremental).",
     )
     parser.add_argument(
         "--until",
         help="End date for extraction (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--full", action="store_true",
+        help="Force full extraction (ignore existing data, fetch all history).",
     )
     parser.add_argument(
         "--batch-size", type=int, default=500,
@@ -656,6 +661,22 @@ def main(argv: list[str] | None = None) -> None:
     # ── Storage ───────────────────────────────────────────────────────────
     storage = get_storage(cfg)
     storage.create_tables()
+
+    # ── Auto-since (incremental by default) ─────────────────────────────
+    if not args.since and not args.full:
+        try:
+            rows = storage.query(
+                "SELECT MAX(committed_date) AS latest FROM commits"
+            )
+            latest = rows[0].get("latest") if rows else None
+            if latest:
+                # Use the exact timestamp of the latest commit — SHA dedup
+                # handles any overlap, so no buffer needed.
+                dt = datetime.fromisoformat(str(latest).replace("Z", "+00:00"))
+                args.since = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                print(f"  Auto-since:  {args.since} (latest commit in storage)", flush=True)
+        except Exception:
+            pass  # empty DB or table missing — will do full extraction
 
     # ── Bot overrides ─────────────────────────────────────────────────────
     if cfg.BOT_OVERRIDES:

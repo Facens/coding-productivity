@@ -38,16 +38,18 @@ Find the plugin scripts directory:
 find ~/.claude/plugins -path '*/coding-productivity/scripts/extract_github.py' 2>/dev/null | head -1 | xargs dirname
 ```
 
-Determine platform from config (`PLATFORM` key). Run via Bash:
+Determine platform from config (`PLATFORM` key).
+
+Extraction is **incremental by default** — the scripts auto-detect the latest commit timestamp in storage and only fetch newer data. When the user provides a date range, pass `--since`/`--until` to scope the extraction.
 
 For GitHub:
 ```bash
-{scripts_dir}/../.coding-productivity/.venv/bin/python {scripts_dir}/extract_github.py --config .coding-productivity.env --since {since} --until {until}
+{scripts_dir}/../.coding-productivity/.venv/bin/python {scripts_dir}/extract_github.py --config .coding-productivity.env [--since {since}] [--until {until}]
 ```
 
 For GitLab:
 ```bash
-{scripts_dir}/../.coding-productivity/.venv/bin/python {scripts_dir}/extract_gitlab.py --config .coding-productivity.env --since {since} --until {until}
+{scripts_dir}/../.coding-productivity/.venv/bin/python {scripts_dir}/extract_gitlab.py --config .coding-productivity.env [--since {since}] [--until {until}]
 ```
 
 If the venv doesn't exist, run `python3 {scripts_dir}/setup_env.py` first.
