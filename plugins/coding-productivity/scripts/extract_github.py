@@ -110,7 +110,8 @@ def _extract_commits(
     # Load existing SHAs for dedup.
     try:
         existing_shas = storage.get_existing_shas("commits")
-    except Exception:
+    except Exception as exc:
+        print(f"[{repo}] Warning: could not load existing SHAs ({exc}), dedup disabled", flush=True)
         existing_shas = set()
 
     print(f"[{repo}] {len(existing_shas):,} existing commits in storage", flush=True)
@@ -708,17 +709,21 @@ def main(argv: list[str] | None = None) -> None:
 
     totals: dict = {"commits": 0, "diffs": 0, "prs": 0, "pr_commits": 0}
 
-    with storage:
-        for repo_slug in repos:
-            stats = _process_repo(
-                client, storage, repo_slug,
-                since=args.since, until=args.until,
-                batch_size=args.batch_size,
-                anon_key=anon_key, merges=merges,
-                mapping_path=mapping_path,
-            )
-            for k in totals:
-                totals[k] += stats.get(k, 0)
+    try:
+        with storage:
+            for repo_slug in repos:
+                stats = _process_repo(
+                    client, storage, repo_slug,
+                    since=args.since, until=args.until,
+                    batch_size=args.batch_size,
+                    anon_key=anon_key, merges=merges,
+                    mapping_path=mapping_path,
+                )
+                for k in totals:
+                    totals[k] += stats.get(k, 0)
+    except KeyboardInterrupt:
+        print("\nExtraction interrupted by user.", flush=True)
+        sys.exit(1)
 
     # ── Summary ───────────────────────────────────────────────────────────
     print(f"\n{'='*60}", flush=True)

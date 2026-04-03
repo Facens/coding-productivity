@@ -251,15 +251,15 @@ def apply_retroactive_merges(
         # Update every identity column in every applicable table.
         for table, columns in _IDENTITY_COLUMNS.items():
             for col in columns:
-                sql = f"UPDATE {table} SET {col} = ? WHERE {col} = ?"
+                sql = f"UPDATE {table} SET {col} = $new_hash WHERE {col} = $old_hash"
                 rows = storage.query(
-                    f"SELECT COUNT(*) AS cnt FROM {table} WHERE {col} = ?",
-                    {"v": old_hash},
+                    f"SELECT COUNT(*) AS cnt FROM {table} WHERE {col} = $old_hash",
+                    {"old_hash": old_hash},
                 )
                 count = rows[0]["cnt"] if rows else 0
 
                 if count > 0:
-                    storage.query(sql, {"new": new_hash, "old": old_hash})
+                    storage.query(sql, {"new_hash": new_hash, "old_hash": old_hash})
                     total_affected += count
 
         # Update the mapping file: add new canonical entry, mark old as merged.

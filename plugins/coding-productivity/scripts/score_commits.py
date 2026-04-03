@@ -566,38 +566,40 @@ def score_commits(
             storage.insert_batch("commit_scores", batch_commit_rows)
         if batch_file_rows:
             storage.insert_batch("file_scores", batch_file_rows)
-        batch_commit_rows = []
-        batch_file_rows = []
+        batch_commit_rows.clear()
+        batch_file_rows.clear()
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_process, c): c for c in commits}
 
-        for future in as_completed(futures):
-            result = future.result()
-            done += 1
+        try:
+            for future in as_completed(futures):
+                result = future.result()
+                done += 1
 
-            with lock:
-                if result:
-                    results.append(result)
+                with lock:
+                    if result:
+                        results.append(result)
 
-                    commit_row = {
-                        k: result[k]
-                        for k in ("commit_sha", "total_productivity",
-                                  "weighted_score", "overall_category",
-                                  "scored_at")
-                    }
-                    batch_commit_rows.append(commit_row)
-                    batch_file_rows.extend(result["files"])
+                        commit_row = {
+                            k: result[k]
+                            for k in ("commit_sha", "total_productivity",
+                                      "weighted_score", "overall_category",
+                                      "scored_at")
+                        }
+                        batch_commit_rows.append(commit_row)
+                        batch_file_rows.extend(result["files"])
 
-                    if len(batch_commit_rows) >= batch_size:
-                        _flush_batch()
+                        if len(batch_commit_rows) >= batch_size:
+                            _flush_batch()
 
                 with _progress_lock:
                     _print_progress(done, len(commits))
-
-    # Final flush
-    _flush_batch()
-    storage.close()
+        finally:
+            # Ensure partial results are flushed and storage is closed
+            # even if a worker raises an exception.
+            _flush_batch()
+            storage.close()
 
     print()  # newline after progress
     return results
