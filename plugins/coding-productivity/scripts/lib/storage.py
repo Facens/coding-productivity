@@ -265,7 +265,11 @@ def get_storage(config) -> Storage:
     if backend == "duckdb":
         if not config.DB_PATH:
             raise ValueError("DB_PATH must be set for the duckdb backend.")
-        return DuckDBStorage(config.DB_PATH, readonly=readonly)
+        # Resolve relative DB_PATH against the config file's directory.
+        db_path = Path(config.DB_PATH)
+        if not db_path.is_absolute() and hasattr(config, "_path"):
+            db_path = Path(config._path).parent / db_path
+        return DuckDBStorage(str(db_path), readonly=readonly)
 
     if backend == "bigquery":
         if not config.GCP_PROJECT_ID or not config.BQ_DATASET:
