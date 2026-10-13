@@ -411,13 +411,29 @@ def _flatten_flags(value: Any) -> list[str]:
     return out
 
 
+def _entry_score(entry: Any) -> float | None:
+    """Finite float score of a well-formed file entry, else None."""
+    if not isinstance(entry, dict):
+        return None
+    path, raw = entry.get("path"), entry.get("score")
+    if not isinstance(path, str) or not path or isinstance(raw, bool):
+        return None
+    try:
+        score = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return score if math.isfinite(score) else None
+
+
 def normalize_score_result(result: Any) -> dict | None:
     """Validate and normalize the model's JSON; None if it breaks the contract.
 
     ``files`` must be a list of objects with a non-empty string ``path`` and a
-    numeric, finite ``score`` (clamped to [0, 1]). Free-text fields are
-    coerced; ``flags`` is flattened to strings. A violation means the answer
-    cannot be trusted, so callers treat it as ``invalid_json`` (retryable).
+    numeric, finite ``score`` (clamped to [0, 1]). An entry that breaks that is
+    dropped and counted in ``dropped_files`` (the rest of the commit is kept).
+    If ``files`` itself is malformed or no valid entry remains, the answer
+    cannot be trusted and callers treat it as ``invalid_json`` (retryable).
+    Free-text fields are coerced; ``flags`` is flattened to strings.
     """
     if not isinstance(result, dict):
         return None
@@ -426,19 +442,14 @@ def normalize_score_result(result: Any) -> dict | None:
         return None
 
     normalized: list[dict] = []
+    dropped = 0
     for f in files:
-        if not isinstance(f, dict):
-            return None
-        path = f.get("path")
-        raw = f.get("score")
-        if not isinstance(path, str) or not path or isinstance(raw, bool):
-            return None
-        try:
-            score = float(raw)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        if not math.isfinite(score):
-            return None
+        # One bad entry costs that file, not the commit.
+        score = _entry_score(f)
+        if score is None:
+            dropped += 1
+            continue
+        path = f["path"]
         category = f.get("category")
         reasoning = f.get("reasoning")
         normalized.append({
@@ -448,9 +459,12 @@ def normalize_score_result(result: Any) -> dict | None:
             "reasoning": reasoning if isinstance(reasoning, str) else "",
         })
 
+    if not normalized:
+        return None  # nothing usable: the answer cannot be trusted
     overall = result.get("overall_category")
     return {
         "files": normalized,
+        "dropped_files": dropped,
         "overall_category": overall[:64] if isinstance(overall, str) else "unknown",
         "flags": _flatten_flags(result.get("flags")),
     }
@@ -488,6 +502,8 @@ class ScoreOutcome:
     input_tokens: int = 0
     output_tokens: int = 0
     failures: list[str] = field(default_factory=list)  # one reason per failed attempt
+    diff_chars: int | None = None  # per-file diff cap of the successful attempt
+    dropped_files: int = 0  # malformed file entries dropped from the answer
 
 
 def _add_usage(outcome: ScoreOutcome, response: Any) -> None:
@@ -526,6 +542,8 @@ def score_commit(client: Any, settings: ScoringSettings, commit: dict,
             if result is not None:
                 outcome.result = result
                 outcome.model = _get(response, "model")
+                outcome.diff_chars = diff_max
+                outcome.dropped_files = result.get("dropped_files", 0)
                 return outcome
             outcome.failures.append(reason or "invalid_json")
 
@@ -595,7 +613,8 @@ def calculate_productivity(score_result: dict, diffs: list[dict]) -> dict | None
 
 
 def rows_from_result(sha: str, score_result: dict, diffs: list[dict],
-                     scorer_model: str | None, prompt_version: str) -> dict | None:
+                     scorer_model: str | None, prompt_version: str,
+                     diff_chars: int | None = None) -> dict | None:
     """Build the storage rows for one scored commit, provenance included.
 
     Returns ``{"commit_row", "file_rows", "total_lines"}`` or None if the
@@ -623,6 +642,7 @@ def rows_from_result(sha: str, score_result: dict, diffs: list[dict],
             "scored_at": scored_at,
             "scorer_model": scorer_model,
             "prompt_version": prompt_version,
+            "diff_chars": diff_chars,
         },
         "file_rows": file_rows,
         "total_lines": prod["total_lines"],
@@ -638,7 +658,7 @@ def score_and_build_rows(client: Any, settings: ScoringSettings, commit: dict,
         return None, outcome
     rows = rows_from_result(
         commit["commit_sha"], outcome.result, diffs,
-        outcome.model, settings.prompt_version,
+        outcome.model, settings.prompt_version, outcome.diff_chars,
     )
     if rows is None:
         outcome.failures.append("invalid_json")
@@ -671,10 +691,14 @@ class FailureLog:
         self.scored: dict[str, int] = {}
         self.unscored: dict[str, int] = {}  # commits that failed all attempts
         self.reasons: dict[str, dict[str, int]] = {}  # month -> reason -> failed attempts
+        self.dropped: dict[str, int] = {}  # month -> malformed file entries dropped
 
-    def record(self, month: str, ok: bool, failures: Iterable[str]) -> None:
+    def record(self, month: str, ok: bool, failures: Iterable[str],
+               dropped: int = 0) -> None:
         bucket = self.scored if ok else self.unscored
         bucket[month] = bucket.get(month, 0) + 1
+        if dropped:
+            self.dropped[month] = self.dropped.get(month, 0) + dropped
         for reason in failures:
             by_reason = self.reasons.setdefault(month, {})
             by_reason[reason] = by_reason.get(reason, 0) + 1
@@ -694,6 +718,10 @@ class FailureLog:
                 f"  {month}: {self.unscored.get(month, 0)} commit(s) unscored, "
                 f"{self.scored.get(month, 0)} scored; failed attempts: {reasons}"
             )
+        if self.dropped:
+            lines.append("  malformed file entries dropped (rest of the commit kept): "
+                         + ", ".join(f"{m}={n}" for m, n in sorted(self.dropped.items())))
+            any_failure = True
         if not any_failure:
             return "Scoring failures by month: none."
         return "\n".join(lines)

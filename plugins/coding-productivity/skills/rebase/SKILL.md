@@ -51,7 +51,7 @@ cd <project_root> && python3.14 scripts/rebase.py --config .coding-productivity.
 - **0**: finished. The report and the activation message were printed.
 - **3**: batches are still processing. Tell the user it can take up to 24 hours and offer to re-run this step later (for example with `/loop` or by asking again). Do not describe it as monitored unless a re-check is actually scheduled.
 - **4**: finished building but not activated: either some commits are still unscored (the report lists reasons), or `--no-activate` was used.
-- **1**: error. Display it. If it says the config no longer matches the unfinished rebase, restore the config, or pass `--restart` to abandon that rebase (its tables stay in storage).
+- **1**: error. Display it. If it says the API refused the batch for billing or credit reasons, nothing was marked failed: tell the user to fix the account and re-run to resume. If it says the config no longer matches the unfinished rebase, restore the config, or pass `--restart` to abandon that rebase (its tables stay in storage).
 
 Failed, errored, expired, refused and truncated batch results are retried automatically through the synchronous scorer.
 

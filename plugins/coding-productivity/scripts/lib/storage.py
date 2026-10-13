@@ -32,7 +32,7 @@ def is_table_missing(exc: BaseException) -> bool:
 
 # Seconds slept between retries of a streaming insert that BigQuery rejects
 # because a table or column created moments ago is not visible yet.
-_STREAM_RETRY_DELAYS = (1, 2, 4, 8, 16)
+_STREAM_RETRY_DELAYS = (2, 4, 8, 16, 32, 64, 120)  # ~4 minutes in total
 _sleep = time.sleep
 
 _NAMED_PARAM = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")

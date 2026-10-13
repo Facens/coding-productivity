@@ -172,7 +172,10 @@ def _check_series(config: Config, storage: Storage,
                 f"--legacy-model {legacy_model} differs from SCORING_MODEL={configured}. "
                 f"Legacy scores from another model cannot be continued; {rebase}."
             )
-        scoring_meta.record(storage, scoring_meta.LEGACY_VERSION, "active", configured, None)
+        # Record this run's prompt_version too, so the prompt-change gate
+        # applies to this series from the next run on (the pre-existing rows
+        # themselves have no known prompt).
+        scoring_meta.record(storage, scoring_meta.LEGACY_VERSION, "active", configured, pv)
         print(f"Recorded the legacy series (v1) as built with {configured}. Analysis over "
               "ranges that mix these rows with newly scored ones needs --allow-legacy-null.",
               flush=True)
@@ -309,8 +312,9 @@ def score_commits(
 
                 with lock:
                     # Commits without diffs are skipped, not failures.
-                    if rows or outcome.failures:
-                        failure_log.record(month, rows is not None, outcome.failures)
+                    if rows or outcome.failures or outcome.dropped_files:
+                        failure_log.record(month, rows is not None, outcome.failures,
+                                           outcome.dropped_files)
                     if rows:
                         results.append({
                             **rows["commit_row"],

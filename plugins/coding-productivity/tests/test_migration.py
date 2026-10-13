@@ -44,12 +44,13 @@ def test_duckdb_create_tables_adds_columns_to_existing_tables(tmp_dir):
 
     storage.create_tables()
 
-    assert NEW_COLUMNS <= _columns(storage, "commit_scores")
+    assert NEW_COLUMNS | {"diff_chars"} <= _columns(storage, "commit_scores")
     assert NEW_COLUMNS <= _columns(storage, "file_scores")
     # Old rows survive with NULL provenance.
     row = storage.query("SELECT * FROM commit_scores")[0]
     assert row["commit_sha"] == "abc"
     assert row["scorer_model"] is None and row["prompt_version"] is None
+    assert row["diff_chars"] is None
     # And new rows can carry it.
     storage.insert_batch("commit_scores", [{
         "commit_sha": "def", "total_productivity": 2.0, "weighted_score": 0.4,

@@ -94,6 +94,9 @@ SCHEMAS: dict[str, OrderedDict[str, str]] = {
             # Provenance: which instrument produced this row.
             ("scorer_model", "VARCHAR"),
             ("prompt_version", "VARCHAR"),
+            # Per-file diff cap actually sent (10000, 2000 or 1000): retries
+            # send less under the same prompt_version. NULL for older rows.
+            ("diff_chars", "INTEGER"),
         ]
     ),
     "file_scores": OrderedDict(

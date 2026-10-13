@@ -70,6 +70,16 @@ EXIT_DONE, EXIT_ERROR, EXIT_PENDING, EXIT_NOT_ACTIVATED = 0, 1, 3, 4
 # Pure helpers (tested without the SDK or a database)
 # ---------------------------------------------------------------------------
 
+_BILLING_MARKERS = ("credit balance", "billing", "purchase credits", "insufficient credit",
+                    "spend limit", "usage limit", "quota")
+
+
+def is_billing_error(exc: BaseException) -> bool:
+    """True if an API error says the account, not the request, is the problem."""
+    text = str(exc).lower()
+    return any(marker in text for marker in _BILLING_MARKERS)
+
+
 def custom_id_for(index: int) -> str:
     """``custom_id`` for the commit at *index* in the state's commit list.
 
@@ -234,7 +244,19 @@ def _submit_chunk(client, state: dict, chunk: list[tuple[str, dict]], save,
     first, last = index_of(chunk[0][0]), index_of(chunk[-1][0])
     try:
         batch = client.messages.batches.create(requests=requests)
-    except anthropic.BadRequestError as exc:
+    except anthropic.APIStatusError as exc:
+        # 400 (invalid request) and 413 (too large) can be caused by one
+        # request; anything else is not ours to handle.
+        if getattr(exc, "status_code", None) not in (400, 413):
+            raise
+        if is_billing_error(exc):
+            # Not a problem with the requests: bisecting would only mark good
+            # commits bad. Stop; the state is saved and a re-run resumes.
+            raise RuntimeError(
+                "The Anthropic API refused the batch for billing or credit reasons "
+                f"({exc}). Nothing was marked failed. Fix the account (credits, "
+                "limits) and run this command again to resume."
+            ) from exc
         if len(chunk) > 1:
             mid = len(chunk) // 2
             _submit_chunk(client, state, chunk[:mid], save, counters)
@@ -244,7 +266,8 @@ def _submit_chunk(client, state: dict, chunk: list[tuple[str, dict]], save,
         if counters["rejected_in_a_row"] >= MAX_CONSECUTIVE_REJECTIONS:
             raise RuntimeError(
                 f"The Batch API rejected {MAX_CONSECUTIVE_REJECTIONS} requests in a row; "
-                f"the request shape is probably invalid for this model. Last error: {exc}"
+                "the request shape is probably invalid for this model, or the account "
+                f"has a billing or quota problem. Last error: {exc}"
             ) from exc
         sha = state["shas"][first]
         state["failed"][sha] = "bad_request"
@@ -313,7 +336,8 @@ def process_batch(client, storage, state: dict, entry: dict, settings, save) -> 
             diffs = _diffs(storage, sha)
             try:
                 rows = scoring.rows_from_result(
-                    sha, score_result, diffs, model, settings.prompt_version
+                    sha, score_result, diffs, model, settings.prompt_version,
+                    scoring.DIFF_SIZES[0],  # batch requests always use the first level
                 )
             except Exception:  # noqa: BLE001
                 rows = None
@@ -325,6 +349,8 @@ def process_batch(client, storage, state: dict, entry: dict, settings, save) -> 
             continue
 
         counts["succeeded"] += 1
+        if score_result.get("dropped_files"):
+            counts["dropped_file_entries"] += score_result["dropped_files"]
         commit_rows.append(rows["commit_row"])
         file_rows.extend(rows["file_rows"])
         if len(commit_rows) >= WRITE_EVERY:

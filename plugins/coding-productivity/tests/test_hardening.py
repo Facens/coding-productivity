@@ -412,13 +412,13 @@ def row():
 def test_no_such_field_is_retried_with_backoff(stream):
     stream._client = StreamClient([NO_FIELD, NO_FIELD, []])
     stream.insert_batch("commit_scores", row())
-    assert stream._client.calls == 3 and stream.sleeps == [1, 2]
+    assert stream._client.calls == 3 and stream.sleeps == [2, 4]
 
 
 def test_404_on_a_fresh_table_is_retried(stream):
     stream._client = StreamClient([NotFound("404 table"), []])
     stream.insert_batch("commit_scores", row())
-    assert stream._client.calls == 2 and stream.sleeps == [1]
+    assert stream._client.calls == 2 and stream.sleeps == [2]
 
 
 def test_other_insert_errors_fail_immediately(stream):
@@ -436,6 +436,7 @@ def test_retry_gives_up_eventually(stream):
     with pytest.raises(RuntimeError, match="no such field"):
         stream.insert_batch("commit_scores", row())
     assert stream._client.calls == len(storage_mod._STREAM_RETRY_DELAYS) + 1
+    assert 240 <= sum(stream.sleeps) <= 300  # waits ~4-5 minutes in total
 
 
 # ── 7. Legacy NULL series needs an explicit acknowledgement ──────────────────
@@ -684,12 +685,14 @@ def test_batch_result_from_another_model_is_failed_and_retried():
 
 # ── 14. Batch API rejections go to the sync path ─────────────────────────────
 
-def bad_request():
-    """An ``anthropic.BadRequestError`` without a real HTTP response (the SDK's
+def bad_request(message="invalid request", status=400):
+    """An ``anthropic.APIStatusError`` without a real HTTP response (the SDK's
     HTTP client library differs between versions)."""
     anthropic = pytest.importorskip("anthropic")
-    err = anthropic.BadRequestError.__new__(anthropic.BadRequestError)
-    Exception.__init__(err, "invalid request")
+    cls = anthropic.BadRequestError if status == 400 else anthropic.APIStatusError
+    err = cls.__new__(cls)
+    Exception.__init__(err, message)
+    err.status_code = status
     return err
 
 
@@ -728,6 +731,172 @@ def test_systematic_rejection_aborts_instead_of_bisecting_forever():
                         "messages": [{"role": "user", "content": "x"}]}) for i in range(64)]
     state = {"shas": [f"s{i}" for i in range(64)], "batches": [], "failed": {}}
     client = NS(messages=NS(batches=AlwaysBad()))
-    with pytest.raises(RuntimeError, match="rejected 10 requests in a row"):
+    with pytest.raises(RuntimeError, match="rejected 10 requests in a row.*billing or quota"):
         rebase._submit_chunk(client, state, chunk, lambda: None, {"rejected_in_a_row": 0})
     assert client.messages.batches.calls < 64 * 2  # stopped early
+
+
+# ── N1. The prompt-change gate applies to a declared legacy series ───────────
+
+def test_prompt_change_is_blocked_after_a_legacy_declaration(score_env, monkeypatch, capsys):
+    score_env.storage.insert_batch("commit_scores", [LEGACY_ROW])
+    score_env.run(FakeClient([make_response(FILES_A)]), legacy_model="claude-haiku-5-5")
+    meta = score_env.storage.query("SELECT * FROM scoring_meta WHERE status = 'active'")
+    assert [(r["version"], r["prompt_version"]) for r in meta] == [(1, PV)]  # P1 recorded
+    assert score_env.storage.count("commit_scores") == 3
+
+    # The scoring logic changes: P2.
+    monkeypatch.setattr(scoring, "SCORING_LOGIC_VERSION", scoring.SCORING_LOGIC_VERSION + 1)
+    score_env.storage.insert_batch("commits", [{
+        "commit_sha": "new001", "title": "t", "message": "m", "authored_date": "2026-03-01T00:00:00Z",
+        "author_email": "a", "author_name": "a", "project_path": "o/r"}])
+    score_env.storage.insert_batch("diffs", [{"commit_sha": "new001", "file_path": "src/auth.py",
+                                              "additions": 5, "deletions": 0, "diff": "+x"}])
+    with pytest.raises(SystemExit):
+        score_env.run(FakeClient([make_response(FILES_A)]))
+    err = capsys.readouterr().err
+    assert PV in err and "--allow-prompt-change" in err
+    assert score_env.storage.count("commit_scores") == 3  # nothing appended under P2
+
+    score_env.run(FakeClient([make_response(FILES_A)]), allow_prompt_change=True)
+    assert score_env.storage.count("commit_scores") == 4
+
+
+# ── N2. One bad file entry costs the file, not the commit ────────────────────
+
+MIXED = {"files": [
+    {"path": "src/auth.py", "score": 0.5, "category": "feature", "reasoning": "ok"},
+    {"path": "src/null.py", "score": None},
+    {"path": "src/missing.py"},
+    "src/string.py",
+    None,
+    {"score": 0.4},
+    {"path": "src/nan.py", "score": float("nan")},
+]}
+
+
+def test_malformed_entries_are_dropped_and_the_commit_is_kept():
+    result, reason = scoring.evaluate_response(text_response(json.dumps(MIXED)))
+    assert reason is None
+    assert [f["path"] for f in result["files"]] == ["src/auth.py"]
+    assert result["dropped_files"] == 6
+
+
+def test_commit_is_rejected_when_no_valid_entry_remains():
+    for files in ([], [None], ["a.py"], [{"path": "a.py", "score": None}], "a.py", None):
+        assert scoring.evaluate_response(text_response({"files": files})) == (None, "invalid_json")
+
+
+def test_dropped_entries_are_counted_and_the_valid_ones_stored():
+    out = scoring.score_commit(FakeClient([text_response(MIXED)]),
+                               scoring.ScoringSettings("claude-haiku-5-5", "S"),
+                               COMMIT, DIFFS, sleep=lambda s: None)
+    assert out.failures == [] and out.dropped_files == 6
+    rows = scoring.rows_from_result("s", out.result, DIFFS, "m", "pv")
+    assert [f["file_path"] for f in rows["file_rows"]] == ["src/auth.py"]
+    log = scoring.FailureLog()
+    log.record("2026-01", True, [], out.dropped_files)
+    assert "dropped" in log.report() and "2026-01=6" in log.report()
+
+
+def test_batch_result_with_a_bad_entry_is_kept(rebase_env_factory):
+    env = rebase_env_factory()
+
+    class OneBadEntry(env.FakeBatches):
+        def results(self, batch_id):
+            for req in self.created[0]:
+                files = [{"path": "src/auth.py" if req["custom_id"] == "r0" else "src/login.py",
+                          "score": 0.5, "category": "feature"}, {"path": "x.py", "score": None}]
+                yield NS(custom_id=req["custom_id"], result=NS(type="succeeded", message=text_response(
+                    {"files": files}, model=req["params"]["model"] + "-20260301")))
+
+    client = env.client(OneBadEntry(), make_response(FILES_A))
+    assert env.run(client) == rebase.EXIT_DONE
+    assert len(client.messages.calls) == 0  # nothing needed the sync path
+    state = json.loads((env.tmp / ".coding-productivity" / "rebase_state.json").read_text())
+    assert state["batches"][0]["counts"] == {"succeeded": 2, "dropped_file_entries": 2}
+
+
+# ── N3. Billing errors abort; 413 is handled like 400 ────────────────────────
+
+def test_billing_error_aborts_without_bisecting_or_marking_commits(rebase_env_factory):
+    env = rebase_env_factory()
+    err = bad_request("Your credit balance is too low to access the Anthropic API.")
+
+    class NoCredit(env.FakeBatches):
+        calls = 0
+
+        def create(self, requests):
+            self.calls += 1
+            raise err
+
+    batches = NoCredit()
+    with pytest.raises(RuntimeError, match="billing or credit"):
+        env.run(env.client(batches, make_response(FILES_A)))
+    assert batches.calls == 1  # no bisection
+    state = json.loads((env.tmp / ".coding-productivity" / "rebase_state.json").read_text())
+    assert state["failed"] == {} and state["batches"] == []  # resumable, nothing marked bad
+    assert scoring_meta.get_active(env.storage).version == 1
+
+
+@pytest.mark.parametrize("message", ["Your credit balance is too low", "billing issue",
+                                     "You have reached your workspace usage limit"])
+def test_billing_markers(message):
+    assert rebase.is_billing_error(bad_request(message))
+    assert not rebase.is_billing_error(bad_request("messages.0.content: Input should be a valid string"))
+
+
+def test_413_is_isolated_like_400(rebase_env_factory):
+    env = rebase_env_factory()
+    err = bad_request("request_too_large", status=413)
+
+    class TooLarge(env.FakeBatches):
+        def create(self, requests):
+            if any(r["custom_id"] == "r1" for r in requests):
+                raise err
+            return super().create(requests)
+
+    client = env.client(TooLarge(), make_response(FILES_B))
+    assert env.run(client) == rebase.EXIT_DONE
+    assert env.storage.count("commit_scores_v2") == 2 and len(client.messages.calls) == 1
+
+
+def test_other_status_errors_still_propagate(rebase_env_factory):
+    env = rebase_env_factory()
+    err = bad_request("overloaded", status=529)
+
+    class Down(env.FakeBatches):
+        def create(self, requests):
+            raise err
+
+    with pytest.raises(type(err)):
+        env.run(env.client(Down(), make_response(FILES_A)))
+
+
+# ── #9 gap. The diff truncation level actually used is recorded ──────────────
+
+def test_commit_rows_record_the_diff_cap_of_the_successful_attempt():
+    s = scoring.ScoringSettings("claude-haiku-5-5", "S")
+    first, _ = scoring.score_and_build_rows(FakeClient([make_response(FILES_A)]), s, COMMIT, DIFFS)
+    assert first["commit_row"]["diff_chars"] == 10_000
+
+    retry, out = scoring.score_and_build_rows(
+        FakeClient([text_response({"files": None}), make_response(FILES_A)]), s, COMMIT, DIFFS)
+    assert retry["commit_row"]["diff_chars"] == 2_000 and out.failures == ["invalid_json"]
+    third, _ = scoring.score_and_build_rows(
+        FakeClient([text_response("nope"), text_response("nope"), make_response(FILES_A)]),
+        s, COMMIT, DIFFS)
+    assert third["commit_row"]["diff_chars"] == 1_000
+    assert s.prompt_version  # unchanged by the retry level: it is recorded, not hashed
+
+
+def test_sync_scoring_stores_the_diff_cap(score_env):
+    score_env.run(FakeClient([make_response(FILES_A)]))
+    assert {r["diff_chars"] for r in score_env.storage.query("SELECT diff_chars FROM commit_scores")} == {10_000}
+
+
+def test_batch_rows_record_the_first_level(rebase_env_factory):
+    env = rebase_env_factory()
+    env.run(env.client(env.FakeBatches(), make_response(FILES_A)))
+    rows = env.storage.query("SELECT diff_chars FROM commit_scores_v2")
+    assert len(rows) == 2 and {r["diff_chars"] for r in rows} == {10_000}
