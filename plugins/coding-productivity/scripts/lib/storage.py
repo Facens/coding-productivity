@@ -8,10 +8,34 @@ selected at runtime via the ``STORAGE_BACKEND`` configuration key.
 from __future__ import annotations
 
 import abc
+import re
+import time
 from pathlib import Path
 from typing import Any, Optional
 
 from . import schema as _schema
+
+_NOT_FOUND_NAMES = {"CatalogException", "NotFound"}
+
+
+def is_table_missing(exc: BaseException) -> bool:
+    """True only for "table (or dataset) does not exist" errors.
+
+    DuckDB raises ``CatalogException``; BigQuery raises
+    ``google.api_core.exceptions.NotFound``. Matched by class name so neither
+    library has to be importable. Any other failure (network, quota,
+    permissions) must propagate: treating it as "no such table" would make
+    callers fall back to the wrong data.
+    """
+    return any(c.__name__ in _NOT_FOUND_NAMES for c in type(exc).__mro__)
+
+
+# Seconds slept between retries of a streaming insert that BigQuery rejects
+# because a table or column created moments ago is not visible yet.
+_STREAM_RETRY_DELAYS = (1, 2, 4, 8, 16)
+_sleep = time.sleep
+
+_NAMED_PARAM = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
 # ── Abstract base ────────────────────────────────────────────────────────────
@@ -299,12 +323,28 @@ class BigQueryStorage(Storage):
 
         # Stream in chunks.
         for i in range(0, len(clean), self._CHUNK_SIZE):
-            chunk = clean[i : i + self._CHUNK_SIZE]
-            errors = self._client.insert_rows_json(ref, chunk)
-            if errors:
+            self._stream_chunk(table, ref, clean[i : i + self._CHUNK_SIZE])
+
+    def _stream_chunk(self, table: str, ref: str, chunk: list[dict]) -> None:
+        """Stream one chunk, retrying while a fresh table or column is not
+        yet visible to the streaming API ("no such field" / 404 right after
+        ``create_table`` or ``update_table``)."""
+        for attempt in range(len(_STREAM_RETRY_DELAYS) + 1):
+            try:
+                errors = self._client.insert_rows_json(ref, chunk)
+            except Exception as exc:  # noqa: BLE001
+                if not is_table_missing(exc):
+                    raise
+                errors, retryable = [str(exc)], True
+            else:
+                retryable = bool(errors) and "no such field" in str(errors).lower()
+            if not errors and not retryable:
+                return
+            if not retryable or attempt == len(_STREAM_RETRY_DELAYS):
                 raise RuntimeError(
                     f"BigQuery streaming insert errors for {table}: {errors}"
                 )
+            _sleep(_STREAM_RETRY_DELAYS[attempt])
 
     def query(self, sql: str, params: Optional[dict] = None) -> list[dict[str, Any]]:
         from google.cloud import bigquery as bq
@@ -315,13 +355,36 @@ class BigQueryStorage(Storage):
             default_dataset=f"{self._project}.{self._dataset}"
         )
         if params:
-            query_params = [
-                bq.ScalarQueryParameter(k, "STRING", v) for k, v in params.items()
+            # The SQL in this plugin uses DuckDB's ``$name`` placeholders;
+            # BigQuery wants ``@name`` and rejects ``$``.
+            sql = _NAMED_PARAM.sub(
+                lambda m: f"@{m.group(1)}" if m.group(1) in params else m.group(0), sql
+            )
+            job_config.query_parameters = [
+                self._query_param(bq, k, v) for k, v in params.items()
             ]
-            job_config.query_parameters = query_params
 
         result = self._client.query(sql, job_config=job_config).result()
         return [dict(row) for row in result]
+
+    @staticmethod
+    def _query_param(bq, name: str, value: Any):
+        """Typed query parameter. Strings stay STRING (dates included)."""
+        def kind(v: Any) -> str:
+            if isinstance(v, bool):
+                return "BOOL"
+            if isinstance(v, int):
+                return "INT64"
+            if isinstance(v, float):
+                return "FLOAT64"
+            return "STRING"
+
+        if isinstance(value, (list, tuple, set)):
+            values = list(value)
+            return bq.ArrayQueryParameter(
+                name, kind(values[0]) if values else "STRING", values
+            )
+        return bq.ScalarQueryParameter(name, kind(value), value)
 
     def get_existing_shas(self, table: str) -> set[str]:
         ref = self._table_ref(table)

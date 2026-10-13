@@ -109,7 +109,7 @@ def test_prompt_version_is_12_hex_and_stable():
 
 
 @pytest.mark.parametrize("change", [
-    {"model": "claude-haiku-5-6"}, {"effort": "high"}, {"max_tokens": 8000},
+    {"model": "claude-haiku-5-6"}, {"effort": "high"},
 ])
 def test_prompt_version_changes_with_every_instrument_input(change):
     assert settings(**change).prompt_version != settings().prompt_version
@@ -119,7 +119,7 @@ def test_prompt_version_changes_with_system_prompt_and_template():
     base = settings().prompt_version
     assert scoring.ScoringSettings("claude-haiku-5-5", "OTHER").prompt_version != base
     args = ("SYS", scoring.USER_PROMPT_TEMPLATE, "claude-haiku-5-5",
-            {"type": "adaptive"}, {"effort": "medium"}, 16000)
+            {"type": "adaptive"}, {"effort": "medium"}, scoring.logic_values_fingerprint())
     assert scoring.compute_prompt_version(*args) == base
     assert scoring.compute_prompt_version("SYS", scoring.USER_PROMPT_TEMPLATE + "!", *args[2:]) != base
 

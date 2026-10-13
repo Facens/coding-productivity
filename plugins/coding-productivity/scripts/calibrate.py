@@ -247,8 +247,8 @@ def calibrate(config: Config, candidate: str, sample: int, workers: int,
         sys.exit(1)
     client = _make_client(config.ANTHROPIC_API_KEY)
 
-    current_settings = scoring.settings_from_config(config)
-    candidate_settings = scoring.settings_from_config(config, model=candidate)
+    current_settings = scoring.settings_or_exit(config)
+    candidate_settings = scoring.settings_or_exit(config, model=candidate)
     current = current_settings.model
     if scoring_meta.model_matches(current, candidate) or candidate == current:
         print(f"Warning: the candidate ({candidate}) is the current model; the "

@@ -102,7 +102,7 @@ If the script exits with a message that the date range mixes scoring models (or 
 > 2. Rescore everything with one model: `/coding-productivity:calibrate`, then `/coding-productivity:rebase`
 > 3. If the legacy scores (no recorded model) are known to come from the same model as the rest, re-run with `--allow-legacy-null`
 
-`--allow-legacy-null` only relaxes NULL-plus-one-model; more than one recorded model is always refused.
+`--allow-legacy-null` only relaxes NULL-plus-one-model; more than one recorded model, or more than one `prompt_version`, is always refused.
 
 If no scoring data exists and the user ran a score-dependent query (category_distribution), explain:
 > Category distribution requires AI scoring data. Run `/coding-productivity:score` first to generate commit scores.

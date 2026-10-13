@@ -114,7 +114,8 @@ class FakeBatches:
             if cid in self.error_ids:
                 yield NS(custom_id=cid, result=NS(type="expired"))
             else:
-                yield NS(custom_id=cid, result=NS(type="succeeded", message=make_response(files)))
+                yield NS(custom_id=cid, result=NS(type="succeeded", message=make_response(
+                    files, model=req["params"]["model"] + "-20260301")))
 
 
 class RebaseClient(FakeClient):
@@ -147,7 +148,8 @@ def rebase_env(tmp_dir, duckdb_storage, sample_commits, sample_diffs, monkeypatc
             setattr(args, k, v)
         return rebase.run(config, args)
 
-    return NS(storage=duckdb_storage, config=config, args=args, run=run, tmp=tmp_dir)
+    return NS(storage=duckdb_storage, config=config, args=args, run=run, tmp=tmp_dir,
+              FakeBatches=FakeBatches, client=RebaseClient)
 
 
 def test_rebase_writes_new_tables_then_activates(rebase_env, capsys):

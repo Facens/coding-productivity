@@ -123,6 +123,9 @@ Wait for completion. If the script exits with an error, display the error and su
 - **Rate limit errors**: suggest reducing `--workers` to 3-5
 - **Authentication errors**: suggest checking the API key via `/coding-productivity:setup`
 - **No commits to score**: this is normal if all commits were already scored
+- **"N existing score(s) have no recorded model"**: scores from before provenance existed. Ask the user which model produced them. If it equals `SCORING_MODEL`, re-run with `--legacy-model <model>` once (recorded; the strict check applies afterwards). If not, or if unknown, use `/coding-productivity:rebase`
+- **"prompt_version is ... but ... was scored with ..."**: the prompt, `SCORING_EFFORT` or the scoring logic changed since the series was built. Prefer `/coding-productivity:rebase`; `--allow-prompt-change` continues the series but `analyze` will then refuse ranges that span both versions
+- **"Unknown scoring model"**: only models known to accept adaptive thinking plus effort, or known to take neither (Haiku 4.x), are accepted. Fix `SCORING_MODEL`
 - **"SCORING_MODEL=... but the active scoring series was built with ..."**: the config model differs from the model of the active series. Mixing models inside one series breaks trends, so scoring refuses. Either set `SCORING_MODEL` back, or run `/coding-productivity:calibrate` and `/coding-productivity:rebase` to move the whole series to the new model
 - **"WARNING: a newer Haiku is available"**: informational. Scoring continues with `SCORING_MODEL`. Never switch models by editing the config alone; run `/coding-productivity:calibrate` first
 

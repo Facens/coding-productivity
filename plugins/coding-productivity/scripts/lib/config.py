@@ -254,6 +254,12 @@ class Config:
                     "scale. Scores written before this setting existed carry no "
                     "model; use the model that produced them."
                 )
+            if self.SCORING_MODEL:
+                from . import scoring  # local import: scoring is optional-SDK aware
+                try:
+                    scoring.check_supported_model(self.SCORING_MODEL)
+                except scoring.UnsupportedModelError as exc:
+                    errors.append(str(exc))
             if self.SCORING_EFFORT not in ("low", "medium", "high", "xhigh", "max"):
                 errors.append(
                     "SCORING_EFFORT must be one of low, medium, high, xhigh, max, "

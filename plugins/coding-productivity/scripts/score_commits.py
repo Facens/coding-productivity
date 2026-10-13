@@ -92,52 +92,90 @@ def _fetch_diffs_for_commit(storage: Storage, sha: str) -> list[dict]:
 # One series = one model
 # ---------------------------------------------------------------------------
 
+def _fail(message: str) -> None:
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
 def _check_series(config: Config, storage: Storage,
                   active: scoring_meta.ActiveScoring,
-                  settings: scoring.ScoringSettings) -> None:
-    """Refuse to append scores from a different model to the active series."""
+                  settings: scoring.ScoringSettings,
+                  legacy_model: str | None = None,
+                  allow_prompt_change: bool = False) -> None:
+    """Refuse to append scores from a different instrument to the active series.
+
+    Instrument = model and ``prompt_version``. A model change always needs a
+    rebase; a prompt_version change (prompt, effort, post-processing logic)
+    needs ``--allow-prompt-change`` if the user really wants to continue the
+    series, in which case analysis will refuse ranges that span both versions.
+    """
     configured = config.SCORING_MODEL
+    pv = settings.prompt_version
+    rebase = ("run /coding-productivity:calibrate and /coding-productivity:rebase "
+              "to move the whole series to the new instrument")
+
+    def check_prompt(existing: str | None, where: str) -> None:
+        if existing and existing != pv and not allow_prompt_change:
+            _fail(
+                f"prompt_version is {pv} but {where} was scored with {existing}: the "
+                "prompt, SCORING_EFFORT or the scoring logic changed. Mixing them "
+                f"inside one series breaks trends. To fix it, {rebase}. Or pass "
+                "--allow-prompt-change to continue anyway (analysis will then refuse "
+                "date ranges that span both versions)."
+            )
 
     if active.from_meta:
         if active.scorer_model != configured:
-            print(
-                f"Error: SCORING_MODEL={configured} but the active scoring series "
-                f"(v{active.version}) was built with {active.scorer_model}.\n"
+            _fail(
+                f"SCORING_MODEL={configured} but the active scoring series "
+                f"(v{active.version}) was built with {active.scorer_model}. "
                 "Mixing models inside one series breaks trends. Either set "
-                f"SCORING_MODEL back to {active.scorer_model}, or run "
-                "/coding-productivity:calibrate and /coding-productivity:rebase "
-                "to move the whole series to the new model.",
-                file=sys.stderr,
+                f"SCORING_MODEL back to {active.scorer_model}, or {rebase}."
             )
-            sys.exit(1)
-        if active.prompt_version and active.prompt_version != settings.prompt_version:
-            print(
-                f"WARNING: prompt_version {settings.prompt_version} differs from the "
-                f"active series ({active.prompt_version}): the prompt, effort or "
-                "max_tokens changed since the series was built. New rows are "
-                "tagged with the new value.",
-                flush=True,
-            )
+        check_prompt(active.prompt_version, f"the active series (v{active.version})")
         return
 
     # Legacy series: the model is only known for rows that carry provenance.
     rows = storage.query(
-        f"SELECT DISTINCT scorer_model FROM {active.commit_table} "
+        f"SELECT DISTINCT scorer_model, prompt_version FROM {active.commit_table} "
         "WHERE scorer_model IS NOT NULL"
     )
-    foreign = [
+    foreign = sorted({
         r["scorer_model"] for r in rows
         if not scoring_meta.model_matches(configured, r["scorer_model"])
-    ]
+    })
     if foreign:
-        print(
-            f"Error: existing scores were produced by {', '.join(sorted(foreign))} "
-            f"but SCORING_MODEL={configured}. Mixing models inside one series "
-            "breaks trends. Set SCORING_MODEL to the existing model, or run "
-            "/coding-productivity:calibrate and /coding-productivity:rebase.",
-            file=sys.stderr,
+        _fail(
+            f"existing scores were produced by {', '.join(foreign)} but "
+            f"SCORING_MODEL={configured}. Mixing models inside one series breaks "
+            f"trends. Set SCORING_MODEL to the existing model, or {rebase}."
         )
-        sys.exit(1)
+    for r in rows:
+        check_prompt(r["prompt_version"], "existing rows")
+
+    null_rows = storage.query(
+        f"SELECT COUNT(*) AS n FROM {active.commit_table} WHERE scorer_model IS NULL"
+    )[0]["n"]
+    if null_rows:
+        # Scores from before provenance existed: the model is unknown, so
+        # appending labelled rows would silently splice two instruments.
+        if not legacy_model:
+            _fail(
+                f"{null_rows:,} existing score(s) have no recorded model (written before "
+                "provenance existed). Declare which model produced them with "
+                f"--legacy-model MODEL (it must equal SCORING_MODEL={configured}); that is "
+                "recorded as the series' model and the strict check applies from then on. "
+                f"If they came from another model, {rebase}."
+            )
+        if legacy_model != configured and not scoring_meta.model_matches(configured, legacy_model):
+            _fail(
+                f"--legacy-model {legacy_model} differs from SCORING_MODEL={configured}. "
+                f"Legacy scores from another model cannot be continued; {rebase}."
+            )
+        scoring_meta.record(storage, scoring_meta.LEGACY_VERSION, "active", configured, None)
+        print(f"Recorded the legacy series (v1) as built with {configured}. Analysis over "
+              "ranges that mix these rows with newly scored ones needs --allow-legacy-null.",
+              flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +212,8 @@ def score_commits(
     config: Config,
     workers: int = 10,
     batch_size: int = 50,
+    legacy_model: str | None = None,
+    allow_prompt_change: bool = False,
 ) -> list[dict]:
     """Score all unscored commits and persist results."""
 
@@ -188,7 +228,7 @@ def score_commits(
         sys.exit(1)
     claude = _make_client(api_key)
 
-    settings = scoring.settings_from_config(config)
+    settings = scoring.settings_or_exit(config)
     prompt_version = settings.prompt_version
     print(
         f"Scoring model: {settings.model} (prompt_version {prompt_version})",
@@ -201,7 +241,8 @@ def score_commits(
     storage.create_tables()
 
     active = scoring_meta.get_active(storage)
-    _check_series(config, storage, active, settings)
+    _check_series(config, storage, active, settings, legacy_model, allow_prompt_change)
+    active = scoring_meta.get_active(storage)  # a declared legacy model is recorded now
     print(f"Writing to scoring series v{active.version} "
           f"({active.commit_table} / {active.file_table}).", flush=True)
 
@@ -249,10 +290,12 @@ def score_commits(
 
     def _flush_batch() -> None:
         """Write accumulated rows to storage."""
-        if batch_commit_rows:
-            storage.insert_batch(active.commit_table, batch_commit_rows)
+        # File rows first, commit row last: the commit row is the completion
+        # marker, so a crash in between leaves the commit unscored (retried).
         if batch_file_rows:
             storage.insert_batch(active.file_table, batch_file_rows)
+        if batch_commit_rows:
+            storage.insert_batch(active.commit_table, batch_commit_rows)
         batch_commit_rows.clear()
         batch_file_rows.clear()
 
@@ -343,6 +386,17 @@ def main() -> None:
         help="Number of parallel API workers (default: 10).",
     )
     parser.add_argument(
+        "--legacy-model", default=None, metavar="MODEL",
+        help="Model that produced existing scores with no recorded model "
+             "(must equal SCORING_MODEL). Required once to continue such a series.",
+    )
+    parser.add_argument(
+        "--allow-prompt-change", action="store_true",
+        help="Continue the active series although prompt_version changed "
+             "(prompt, effort or scoring logic). Analysis will refuse ranges "
+             "that span both versions.",
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=50,
@@ -365,7 +419,10 @@ def main() -> None:
         )
         sys.exit(1)
 
-    results = score_commits(config, workers=args.workers, batch_size=args.batch_size)
+    results = score_commits(
+        config, workers=args.workers, batch_size=args.batch_size,
+        legacy_model=args.legacy_model, allow_prompt_change=args.allow_prompt_change,
+    )
     _print_summary(results)
 
 

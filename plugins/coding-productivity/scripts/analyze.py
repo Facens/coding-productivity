@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib import scoring_meta
 from lib.config import Config
-from lib.storage import get_storage, Storage
+from lib.storage import get_storage, is_table_missing, Storage
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -105,7 +105,9 @@ def _has_scores(storage: Storage) -> bool:
             f"SELECT COUNT(*) AS cnt FROM {_commit_scores_table(storage)}"
         )
         return rows[0]["cnt"] > 0 if rows else False
-    except Exception:
+    except Exception as exc:
+        if not is_table_missing(exc):
+            raise
         return False
 
 
@@ -123,8 +125,9 @@ def check_single_scorer_model(storage: Storage, config: Config,
     commits in *ranges* (``[since, until)`` pairs, as used by the queries) have
 
     * more than one distinct non-NULL ``scorer_model``, or
-    * NULL plus non-NULL ``scorer_model`` (legacy rows predate provenance),
-      unless *allow_legacy_null* is set.
+    * more than one distinct non-NULL ``prompt_version``, or
+    * NULL plus non-NULL provenance (legacy rows predate it), unless
+      *allow_legacy_null* is set. The first two are never relaxed.
     """
     table = _commit_scores_table(storage)
 
@@ -148,23 +151,29 @@ def check_single_scorer_model(storage: Storage, config: Config,
         params.update(excl_params)
 
     sql = f"""
-    SELECT s.scorer_model AS scorer_model, COUNT(*) AS n
+    SELECT s.scorer_model AS scorer_model, s.prompt_version AS prompt_version,
+           COUNT(*) AS n
     FROM commits c
     JOIN {table} s ON c.commit_sha = s.commit_sha
     WHERE {" AND ".join(clauses)}
-    GROUP BY s.scorer_model
+    GROUP BY s.scorer_model, s.prompt_version
     """
     try:
         rows = storage.query(sql, params)
     except Exception as exc:
-        # A table created before provenance existed has no scorer_model column
+        # A table created before provenance existed has no such columns
         # (e.g. a read-only connection never ran create_tables): all NULL.
-        if "scorer_model" not in str(exc):
+        if "scorer_model" not in str(exc) and "prompt_version" not in str(exc):
             raise
         return
 
-    models = sorted(r["scorer_model"] for r in rows if r["scorer_model"] is not None)
-    null_count = sum(r["n"] for r in rows if r["scorer_model"] is None)
+    models = sorted({r["scorer_model"] for r in rows if r["scorer_model"] is not None})
+    versions = sorted({r["prompt_version"] for r in rows if r["prompt_version"] is not None})
+    # A row without a recorded model or prompt_version predates provenance.
+    legacy = sum(r["n"] for r in rows
+                 if r["scorer_model"] is None or r["prompt_version"] is None)
+    recorded = sum(r["n"] for r in rows
+                   if r["scorer_model"] is not None and r["prompt_version"] is not None)
 
     if len(models) > 1:
         raise MixedScorerModelError(
@@ -174,12 +183,20 @@ def check_single_scorer_model(storage: Storage, config: Config,
             "or rescore everything with one model: /coding-productivity:calibrate "
             "then /coding-productivity:rebase."
         )
-    if models and null_count and not allow_legacy_null:
+    if len(versions) > 1:
         raise MixedScorerModelError(
-            f"The selected date range mixes {null_count} legacy score(s) with no "
-            f"recorded model and scores from {models[0]}. Legacy rows predate "
-            "provenance, so the model that produced them is unknown. If you know "
-            "they came from the same model, re-run with --allow-legacy-null; "
+            "The selected date range contains scores from more than one "
+            f"prompt_version ({', '.join(versions)}): the prompt, effort or scoring "
+            "logic changed in between, so the scores are not on one scale. Narrow "
+            "the range, or rescore everything: /coding-productivity:rebase."
+        )
+    if recorded and legacy and not allow_legacy_null:
+        raise MixedScorerModelError(
+            f"The selected date range mixes {legacy} legacy score(s) with no recorded "
+            f"model or prompt_version and {recorded} score(s) from {models[0]} "
+            f"(prompt_version {versions[0]}). Legacy rows predate provenance, so the "
+            "instrument that produced them is unknown. If you know they came from "
+            "the same model and prompt, re-run with --allow-legacy-null; "
             "otherwise rescore with /coding-productivity:rebase."
         )
 

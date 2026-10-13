@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
+from .storage import is_table_missing
+
 LEGACY_VERSION = 1
 
 _VERSIONED_RE = re.compile(r"^(?:commit|file)_scores_v([0-9]+)$")
@@ -60,8 +62,12 @@ def get_active(storage) -> ActiveScoring:
             "FROM scoring_meta WHERE status = 'active' "
             "ORDER BY recorded_at DESC, version DESC LIMIT 1"
         )
-    except Exception:
-        # No scoring_meta table yet (older install or read-only connection).
+    except Exception as exc:
+        # Only "no scoring_meta table yet" (older install, read-only
+        # connection) means legacy. A transient error must not: the caller
+        # would write current-model rows into the legacy tables.
+        if not is_table_missing(exc):
+            raise
         return _legacy()
     if not rows:
         return _legacy()
@@ -84,13 +90,14 @@ def next_free_version(storage, reserved: tuple[int, ...] = ()) -> int:
     try:
         for r in storage.query("SELECT DISTINCT version FROM scoring_meta"):
             seen.add(int(r["version"]))
-    except Exception:
-        pass
+    except Exception as exc:
+        if not is_table_missing(exc):
+            raise
     return max(seen | {LEGACY_VERSION}) + 1
 
 
 def record(storage, version: int, status: str, scorer_model: str,
-           prompt_version: str) -> None:
+           prompt_version: Optional[str]) -> None:
     """Append a ``building`` or ``active`` row to ``scoring_meta``."""
     if status not in ("building", "active"):
         raise ValueError(f"Invalid scoring_meta status: {status}")

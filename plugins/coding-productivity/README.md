@@ -82,8 +82,8 @@ All config lives in `.coding-productivity.env` (created by setup, gitignored aut
 The scoring model is a measuring instrument: **one series = one model**. A newer model can change the scale of the scores, and the shift differs by period, so a series that mixes two models shows a trend in the instrument rather than in productivity. No single conversion factor repairs that. The plugin therefore never switches models for you:
 
 - `SCORING_MODEL` is explicit (setup writes `claude-haiku-5-5`). A newer Haiku only produces a WARNING.
-- Every score row records `scorer_model` (what the API returned) and `prompt_version` (a hash of prompt, model, thinking config, effort and max tokens).
-- `analyze` refuses date ranges that contain more than one recorded model, and refuses recorded-plus-unrecorded (legacy) scores unless you pass `--allow-legacy-null`. `score` refuses to append scores from a model other than the active series' model.
+- Every score row records `scorer_model` (what the API returned) and `prompt_version` (a hash of prompt, model, thinking config, effort and the scoring post-processing rules).
+- `analyze` refuses date ranges that contain more than one recorded model or `prompt_version`, and refuses recorded-plus-unrecorded (legacy) scores unless you pass `--allow-legacy-null`. `score` refuses to append scores from another model, or from another `prompt_version` unless you pass `--allow-prompt-change`. To continue a series whose scores carry no recorded model, declare it once with `score --legacy-model <model>` (it must equal `SCORING_MODEL`).
 
 To change models:
 

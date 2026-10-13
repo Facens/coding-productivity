@@ -4,7 +4,10 @@ import json
 from types import SimpleNamespace as _NS
 
 
-def make_response(files, model="claude-haiku-5-5-20260301", stop_reason="end_turn",
+DEFAULT_RESPONSE_MODEL = "claude-haiku-5-5-20260301"
+
+
+def make_response(files, model=DEFAULT_RESPONSE_MODEL, stop_reason="end_turn",
                   thinking_first=True, tokens=(100, 50), overall="feature"):
     """A Messages-API-shaped response. 5.x models put a thinking block first."""
     payload = {"files": files, "overall_category": overall, "flags": []}
@@ -28,8 +31,11 @@ class FakeMessages:
     def create(self, **params):
         self.calls.append(params)
         item = self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
-        if isinstance(item, Exception):
+        if isinstance(item, BaseException):
             raise item
+        # A real API answers with the model that was asked for.
+        if getattr(item, "model", None) == DEFAULT_RESPONSE_MODEL:
+            item = _NS(**{**vars(item), "model": params["model"] + "-20260301"})
         return item
 
 

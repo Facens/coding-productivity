@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import string
@@ -22,6 +23,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
+
+from .scoring_meta import model_matches
 
 try:  # optional dependency
     import anthropic
@@ -88,14 +91,18 @@ LARGE_JSON_MAX_SCORE = 0.05
 # Diff truncation per attempt: later attempts send less.
 DIFF_SIZES = [10_000, 2_000, 1_000]
 
+# Cut lengths in the prompt and in stored text.
+MESSAGE_MAX_CHARS = 500
+REASONING_MAX_CHARS = 1000
+
+# Bump when post-processing CODE changes behaviour in a way the values in
+# ``logic_values_fingerprint`` cannot see (apply_score_caps, how scores are
+# aggregated, normalization). tests/test_scoring.py pins golden outputs and
+# the fingerprint so a silent change fails the suite.
+SCORING_LOGIC_VERSION = 1
+
 # Stop reasons that mean "no usable answer", even when the call succeeded.
 FAILED_STOP_REASONS = ("refusal", "max_tokens")
-
-FALLBACK_SYSTEM_PROMPT = (
-    "You are an expert panel of 3 senior software engineers evaluating code "
-    "commits for a productivity analysis. Score each file from 0.0 to 1.0 "
-    "based on intellectual effort and value, NOT just lines of code."
-)
 
 # The user prompt. Part of the instrument definition: it is hashed into
 # ``prompt_version``, so changing it here starts a new series.
@@ -117,15 +124,17 @@ _USER_TEMPLATE = string.Template(USER_PROMPT_TEMPLATE)
 # ── Prompt ───────────────────────────────────────────────────────────────────
 
 def load_scoring_prompt() -> str:
-    """Read the scoring rubric shipped in references/."""
+    """Read the scoring rubric shipped in references/.
+
+    A missing file is an error, never a silent fallback: a different prompt is
+    a different instrument, and its scores would join the series unnoticed.
+    """
     prompt_path = _SCRIPT_DIR.parent / "references" / "commit_scoring_prompt.md"
     if not prompt_path.is_file():
-        print(
-            f"Warning: scoring prompt not found at {prompt_path}; "
-            "using built-in fallback.",
-            flush=True,
+        raise FileNotFoundError(
+            f"Scoring prompt not found at {prompt_path}. Reinstall the plugin; "
+            "scoring will not run with a substitute prompt."
         )
-        return FALLBACK_SYSTEM_PROMPT
     return prompt_path.read_text(encoding="utf-8")
 
 
@@ -178,7 +187,7 @@ def build_user_prompt(commit: dict, diffs: list[dict], diff_max: int = DIFF_SIZE
 
     return _USER_TEMPLATE.substitute(
         title=commit.get("title", "") or "",
-        message=(commit.get("message") or commit.get("title", "") or "")[:500],
+        message=(commit.get("message") or commit.get("title", "") or "")[:MESSAGE_MAX_CHARS],
         file_list="\n".join(file_list_lines),
         diffs="\n".join(parts),
     )
@@ -186,11 +195,72 @@ def build_user_prompt(commit: dict, diffs: list[dict], diff_max: int = DIFF_SIZE
 
 # ── Instrument definition ────────────────────────────────────────────────────
 
-def supports_adaptive_thinking(model: str) -> bool:
-    """False for Haiku 4.x and the 3.x line: they take neither adaptive
-    thinking nor ``output_config.effort``."""
+# Models known to accept ``thinking={"type": "adaptive"}`` together with
+# ``output_config.effort``. Matched as an exact ID or ID plus ``-<suffix>``
+# (dated snapshots). Everything else is rejected at startup rather than
+# failing with 400s in the middle of a rebase.
+ADAPTIVE_MODEL_PREFIXES = (
+    "claude-haiku-5", "claude-sonnet-5", "claude-sonnet-4-6",
+    "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+    "claude-fable", "claude-mythos",
+)
+# Known models that take neither parameter: send neither.
+NO_THINKING_MODEL_PREFIXES = ("claude-haiku-4", "claude-3")
+
+
+class UnsupportedModelError(ValueError):
+    """The model is not on the allowlist of models the plugin knows how to ask."""
+
+
+def _has_prefix(model: str, prefix: str) -> bool:
+    return model == prefix or model.startswith(prefix + "-")
+
+
+def model_kind(model: str) -> Optional[str]:
+    """``"adaptive"``, ``"legacy"`` (no thinking/effort) or None (unknown)."""
     m = (model or "").lower()
-    return not (m.startswith("claude-haiku-4") or m.startswith("claude-3"))
+    if any(_has_prefix(m, p) for p in NO_THINKING_MODEL_PREFIXES):
+        return "legacy"
+    if any(_has_prefix(m, p) for p in ADAPTIVE_MODEL_PREFIXES):
+        return "adaptive"
+    return None
+
+
+def supports_adaptive_thinking(model: str) -> bool:
+    return model_kind(model) == "adaptive"
+
+
+def check_supported_model(model: str) -> None:
+    if model_kind(model) is None:
+        raise UnsupportedModelError(
+            f"Unknown scoring model '{model}'. Supported: Haiku 4.x (no thinking), "
+            "and Haiku 5.x, Sonnet 4.6/5.x, Opus 4.6+/5.x, Fable, Mythos "
+            "(adaptive thinking). Add the model family to ADAPTIVE_MODEL_PREFIXES "
+            "in scripts/lib/scoring.py once it is known to accept "
+            "thinking={'type': 'adaptive'} and output_config.effort."
+        )
+
+
+def logic_values_fingerprint() -> str:
+    """Hash of the post-processing constants (and ``SCORING_LOGIC_VERSION``).
+
+    These shape every stored score but are not part of the request, so they
+    are folded into ``prompt_version`` separately.
+    """
+    payload = json.dumps(
+        {
+            "logic_version": SCORING_LOGIC_VERSION,
+            "auto_score_patterns": AUTO_SCORE_PATTERNS,
+            "max_score_by_extension": MAX_SCORE_BY_EXTENSION,
+            "large_json": [LARGE_JSON_THRESHOLD, LARGE_JSON_MAX_SCORE],
+            "diff_sizes": DIFF_SIZES,
+            "message_max_chars": MESSAGE_MAX_CHARS,
+            "reasoning_max_chars": REASONING_MAX_CHARS,
+            "valid_categories": sorted(VALID_CATEGORIES),
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
 @dataclass(frozen=True)
@@ -201,6 +271,9 @@ class ScoringSettings:
     system_prompt: str
     effort: str = DEFAULT_EFFORT
     max_tokens: int = DEFAULT_MAX_TOKENS
+
+    def __post_init__(self) -> None:
+        check_supported_model(self.model)
 
     @property
     def thinking(self) -> Optional[dict]:
@@ -216,7 +289,7 @@ class ScoringSettings:
     def prompt_version(self) -> str:
         return compute_prompt_version(
             self.system_prompt, USER_PROMPT_TEMPLATE, self.model,
-            self.thinking, self.output_config, self.max_tokens,
+            self.thinking, self.output_config, logic_values_fingerprint(),
         )
 
     def build_params(self, user_prompt: str) -> dict:
@@ -246,10 +319,26 @@ def settings_from_config(config, model: Optional[str] = None) -> ScoringSettings
     )
 
 
+def settings_or_exit(config, model: Optional[str] = None) -> ScoringSettings:
+    """``settings_from_config`` for CLI entry points: a clear message and exit
+    code 1 instead of a traceback (unknown model, missing prompt file)."""
+    import sys
+    try:
+        return settings_from_config(config, model)
+    except (UnsupportedModelError, FileNotFoundError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
 def compute_prompt_version(system_prompt: str, user_template: str, model: str,
                            thinking: Optional[dict], output_config: Optional[dict],
-                           max_tokens: int) -> str:
-    """First 12 hex of sha256 over everything that defines the instrument."""
+                           logic: str) -> str:
+    """First 12 hex of sha256 over everything that defines the instrument.
+
+    ``max_tokens`` is deliberately not part of it: it is a failure-handling
+    knob (raising it rescues truncated answers) and must be changeable in the
+    middle of a rebase.
+    """
     payload = json.dumps(
         {
             "system": system_prompt,
@@ -257,7 +346,7 @@ def compute_prompt_version(system_prompt: str, user_template: str, model: str,
             "model": model,
             "thinking": thinking,
             "effort": (output_config or {}).get("effort"),
-            "max_tokens": max_tokens,
+            "logic": logic,
         },
         sort_keys=True, ensure_ascii=False,
     )
@@ -309,22 +398,85 @@ def parse_json_response(text: str) -> dict | None:
     return None
 
 
-def evaluate_response(response: Any) -> tuple[dict | None, str | None]:
+def _flatten_flags(value: Any) -> list[str]:
+    """Flags as a flat list of strings; anything else is dropped (models have
+    returned nested lists, which BigQuery rejects)."""
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        out.extend(_flatten_flags(item))
+    return out
+
+
+def normalize_score_result(result: Any) -> dict | None:
+    """Validate and normalize the model's JSON; None if it breaks the contract.
+
+    ``files`` must be a list of objects with a non-empty string ``path`` and a
+    numeric, finite ``score`` (clamped to [0, 1]). Free-text fields are
+    coerced; ``flags`` is flattened to strings. A violation means the answer
+    cannot be trusted, so callers treat it as ``invalid_json`` (retryable).
+    """
+    if not isinstance(result, dict):
+        return None
+    files = result.get("files")
+    if not isinstance(files, list):
+        return None
+
+    normalized: list[dict] = []
+    for f in files:
+        if not isinstance(f, dict):
+            return None
+        path = f.get("path")
+        raw = f.get("score")
+        if not isinstance(path, str) or not path or isinstance(raw, bool):
+            return None
+        try:
+            score = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(score):
+            return None
+        category = f.get("category")
+        reasoning = f.get("reasoning")
+        normalized.append({
+            "path": path,
+            "score": min(1.0, max(0.0, score)),
+            "category": category if isinstance(category, str) else "unknown",
+            "reasoning": reasoning if isinstance(reasoning, str) else "",
+        })
+
+    overall = result.get("overall_category")
+    return {
+        "files": normalized,
+        "overall_category": overall[:64] if isinstance(overall, str) else "unknown",
+        "flags": _flatten_flags(result.get("flags")),
+    }
+
+
+def evaluate_response(response: Any, expected_model: str | None = None
+                      ) -> tuple[dict | None, str | None]:
     """Turn a Messages response into ``(score_result, failure_reason)``.
 
     A refusal or a ``max_tokens`` stop is a failed attempt even though the
-    call itself succeeded: the text, if any, is incomplete or absent.
+    call itself succeeded: the text, if any, is incomplete or absent. So is an
+    answer from a different model than *expected_model* (``model_mismatch``)
+    and one that breaks the JSON contract (``invalid_json``).
     """
     stop = _get(response, "stop_reason")
     if stop in FAILED_STOP_REASONS:
         return None, stop
+    if expected_model is not None and not model_matches(expected_model, _get(response, "model")):
+        return None, "model_mismatch"
     text = extract_text(response)
     if text is None:
         return None, "no_text"
-    result = parse_json_response(text)
-    if isinstance(result, dict) and "files" in result:
-        return result, None
-    return None, "invalid_json"
+    result = normalize_score_result(parse_json_response(text))
+    if result is None:
+        return None, "invalid_json"
+    return result, None
 
 
 @dataclass
@@ -370,7 +522,7 @@ def score_commit(client: Any, settings: ScoringSettings, commit: dict,
                 outcome.failures.append("error")
         else:
             _add_usage(outcome, response)
-            result, reason = evaluate_response(response)
+            result, reason = evaluate_response(response, settings.model)
             if result is not None:
                 outcome.result = result
                 outcome.model = _get(response, "model")
@@ -387,7 +539,8 @@ def score_commit(client: Any, settings: ScoringSettings, commit: dict,
 
 def calculate_productivity(score_result: dict, diffs: list[dict]) -> dict | None:
     """Aggregate per-file scores into commit-level productivity metrics."""
-    if not score_result or "files" not in score_result:
+    score_result = normalize_score_result(score_result)
+    if score_result is None:
         return None
 
     diff_lines: dict[str, dict] = {}
@@ -405,23 +558,19 @@ def calculate_productivity(score_result: dict, diffs: list[dict]) -> dict | None
     file_scores: list[dict] = []
 
     for fs in score_result["files"]:
-        path = fs.get("path")
+        path = fs["path"]
         if path not in diff_lines:
-            continue
-        try:
-            raw_score = float(fs["score"])
-        except (KeyError, TypeError, ValueError):
             continue
 
         info = diff_lines[path]
         lines = info["total"]
-        score = apply_score_caps(path, raw_score, lines)
+        score = apply_score_caps(path, fs["score"], lines)
 
         # productivity = score * max(additions, 1)
         total_productivity += score * max(info["additions"], 1)
         total_lines += lines
 
-        cat = fs.get("category", "unknown")
+        cat = fs["category"]
         if cat not in VALID_CATEGORIES:
             cat = "chore"
 
@@ -430,7 +579,7 @@ def calculate_productivity(score_result: dict, diffs: list[dict]) -> dict | None
             "file_path": path,
             "score": round(score, 4),
             "category": cat,
-            "reasoning": (fs.get("reasoning") or "")[:1000],
+            "reasoning": fs["reasoning"][:REASONING_MAX_CHARS],
             "scored_at": "",  # filled in by caller
         })
 
@@ -441,7 +590,7 @@ def calculate_productivity(score_result: dict, diffs: list[dict]) -> dict | None
         "total_productivity": round(total_productivity, 4),
         "weighted_score": round(weighted_score, 4),
         "total_lines": total_lines,
-        "overall_category": score_result.get("overall_category", "unknown"),
+        "overall_category": score_result["overall_category"],
     }
 
 

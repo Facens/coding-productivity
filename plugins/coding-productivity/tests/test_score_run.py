@@ -52,7 +52,7 @@ def test_score_writes_provenance_to_the_active_tables(env):
 def test_score_continues_in_the_active_versioned_series(env):
     env.storage.ensure_table("commit_scores_v2")
     env.storage.ensure_table("file_scores_v2")
-    scoring_meta.record(env.storage, 2, "active", "claude-haiku-5-5", "x")
+    scoring_meta.record(env.storage, 2, "active", "claude-haiku-5-5", PV)
     env.monkeypatch.setattr(score_commits, "_make_client",
                             lambda key: FakeClient([make_response(FILES_A)]))
     score_commits.score_commits(config(env.tmp), workers=1)

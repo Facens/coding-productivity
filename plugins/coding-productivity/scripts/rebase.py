@@ -43,7 +43,7 @@ import os
 import sys
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -60,6 +60,8 @@ from lib.storage import get_storage
 MAX_BATCH_REQUESTS = 100_000
 MAX_BATCH_BYTES = 200 * 1024 * 1024
 WRITE_EVERY = 500
+SYNC_FLUSH_EVERY = 25  # commits between writes (and state saves) in the sync fallback
+MAX_CONSECUTIVE_REJECTIONS = 10
 
 EXIT_DONE, EXIT_ERROR, EXIT_PENDING, EXIT_NOT_ACTIVATED = 0, 1, 3, 4
 
@@ -118,14 +120,16 @@ def chunk_requests(items: Iterable[tuple[str, dict]],
         yield chunk
 
 
-def classify_item(item: Any) -> tuple[dict | None, str | None, tuple[int, int], str | None]:
+def classify_item(item: Any, expected_model: str | None = None
+                  ) -> tuple[dict | None, str | None, tuple[int, int], str | None]:
     """Read one batch result.
 
     Returns ``(score_result, response_model, (input_tokens, output_tokens),
     failure_reason)``. Anything but a usable answer has a failure reason:
     ``errored``, ``canceled``, ``expired``, or what ``evaluate_response``
-    reports (``refusal``, ``max_tokens``, ``no_text``, ``invalid_json``). A
-    "succeeded" result can still carry a refusal or a truncated answer.
+    reports (``refusal``, ``max_tokens``, ``model_mismatch``, ``no_text``,
+    ``invalid_json``). A "succeeded" result can still carry a refusal, a
+    truncated answer or output that breaks the JSON contract.
     """
     result = item.result
     if result.type != "succeeded":
@@ -136,7 +140,7 @@ def classify_item(item: Any) -> tuple[dict | None, str | None, tuple[int, int], 
         (getattr(usage, "input_tokens", 0) or 0, getattr(usage, "output_tokens", 0) or 0)
         if usage is not None else (0, 0)
     )
-    score_result, reason = scoring.evaluate_response(message)
+    score_result, reason = scoring.evaluate_response(message, expected_model)
     return score_result, getattr(message, "model", None), tokens, reason
 
 
@@ -192,10 +196,13 @@ def _diffs(storage, sha: str) -> list[dict]:
 
 
 def _write_rows(storage, state: dict, commit_rows: list[dict], file_rows: list[dict]) -> None:
-    if commit_rows:
-        storage.insert_batch(state["commit_table"], commit_rows)
+    """File rows first, commit rows last: a commit row is the completion
+    marker (resume skips commits that have one), so a crash between the two
+    inserts leaves the commit unscored and retried, never half-visible."""
     if file_rows:
         storage.insert_batch(state["file_table"], file_rows)
+    if commit_rows:
+        storage.insert_batch(state["commit_table"], commit_rows)
     commit_rows.clear()
     file_rows.clear()
 
@@ -212,55 +219,104 @@ def _iter_requests(storage, state: dict, settings: scoring.ScoringSettings,
         yield custom_id_for(i), settings.build_params(prompt)
 
 
-def submit_remaining(client, storage, state: dict, settings: scoring.ScoringSettings,
-                     save, max_bytes: int, max_requests: int) -> None:
+def _submit_chunk(client, state: dict, chunk: list[tuple[str, dict]], save,
+                  counters: dict) -> None:
+    """Create one batch; if the API rejects it (400), bisect to isolate the
+    offending request(s) and send those to the synchronous path."""
+    import anthropic
     from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
     from anthropic.types.messages.batch_create_params import Request
 
+    requests = [
+        Request(custom_id=cid, params=MessageCreateParamsNonStreaming(**params))
+        for cid, params in chunk
+    ]
+    first, last = index_of(chunk[0][0]), index_of(chunk[-1][0])
+    try:
+        batch = client.messages.batches.create(requests=requests)
+    except anthropic.BadRequestError as exc:
+        if len(chunk) > 1:
+            mid = len(chunk) // 2
+            _submit_chunk(client, state, chunk[:mid], save, counters)
+            _submit_chunk(client, state, chunk[mid:], save, counters)
+            return
+        counters["rejected_in_a_row"] += 1
+        if counters["rejected_in_a_row"] >= MAX_CONSECUTIVE_REJECTIONS:
+            raise RuntimeError(
+                f"The Batch API rejected {MAX_CONSECUTIVE_REJECTIONS} requests in a row; "
+                f"the request shape is probably invalid for this model. Last error: {exc}"
+            ) from exc
+        sha = state["shas"][first]
+        state["failed"][sha] = "bad_request"
+        state["batches"].append({
+            "id": None, "start": first, "end": last + 1, "processed": True,
+            "rejected": True, "error": str(exc)[:300],
+        })
+        save()
+        print(f"  request {chunk[0][0]} rejected by the Batch API; it will be scored "
+              "synchronously", flush=True)
+        return
+
+    counters["rejected_in_a_row"] = 0
+    state["batches"].append({
+        "id": batch.id, "start": first, "end": last + 1, "processed": False,
+        "submitted_at": datetime.now(timezone.utc).isoformat(),
+    })
+    save()  # persist right away: a lost batch id is paid-for work
+    print(f"  batch {batch.id}: {len(chunk):,} requests", flush=True)
+
+
+def submit_remaining(client, storage, state: dict, settings: scoring.ScoringSettings,
+                     save, max_bytes: int, max_requests: int) -> None:
     start = state["batches"][-1]["end"] if state["batches"] else 0
     total = len(state["shas"])
     if start >= total:
         return
     print(f"Submitting {total - start:,} of {total:,} commits as batches...", flush=True)
 
+    counters = {"rejected_in_a_row": 0}
     for chunk in chunk_requests(_iter_requests(storage, state, settings, start),
                                 max_bytes, max_requests):
-        requests = [
-            Request(custom_id=cid, params=MessageCreateParamsNonStreaming(**params))
-            for cid, params in chunk
-        ]
-        batch = client.messages.batches.create(requests=requests)
-        state["batches"].append({
-            "id": batch.id,
-            "start": index_of(chunk[0][0]),
-            "end": index_of(chunk[-1][0]) + 1,
-            "processed": False,
-            "submitted_at": datetime.now(timezone.utc).isoformat(),
-        })
-        save()  # persist right away: a lost batch id is paid-for work
-        print(f"  batch {batch.id}: {len(chunk):,} requests", flush=True)
+        _submit_chunk(client, state, chunk, save, counters)
 
 
 def process_batch(client, storage, state: dict, entry: dict, settings, save) -> None:
-    """Write one ended batch's results; queue failures for the sync path."""
+    """Write one ended batch's results; queue failures for the sync path.
+
+    One malformed result never aborts the rest: it is counted, marked failed
+    (retried synchronously later) and the loop moves on. The batch is always
+    marked processed at the end.
+    """
     existing = storage.get_existing_shas(state["commit_table"])  # resume safety
     commit_rows: list[dict] = []
     file_rows: list[dict] = []
     counts: Counter = Counter()
 
     for item in client.messages.batches.results(entry["id"]):
-        sha = state["shas"][index_of(item.custom_id)]
+        try:
+            sha = state["shas"][index_of(item.custom_id)]
+        except (ValueError, IndexError, AttributeError):
+            counts["unknown_custom_id"] += 1
+            continue
         if sha in existing:
             continue
-        score_result, model, (tin, tout), reason = classify_item(item)
+
+        try:
+            score_result, model, (tin, tout), reason = classify_item(item, settings.model)
+        except Exception:  # noqa: BLE001 - a malformed item must not stop the batch
+            score_result, model, tin, tout, reason = None, None, 0, 0, "malformed_result"
         state["tokens"]["batch_input"] += tin
         state["tokens"]["batch_output"] += tout
 
         rows = None
         if score_result is not None:
-            rows = scoring.rows_from_result(
-                sha, score_result, _diffs(storage, sha), model, settings.prompt_version
-            )
+            diffs = _diffs(storage, sha)
+            try:
+                rows = scoring.rows_from_result(
+                    sha, score_result, diffs, model, settings.prompt_version
+                )
+            except Exception:  # noqa: BLE001
+                rows = None
             if rows is None:
                 reason = "invalid_json"
         if rows is None:
@@ -300,8 +356,14 @@ def collect(client, storage, state: dict, settings, save) -> bool:
     return pending
 
 
-def sync_fallback(client, storage, state: dict, settings, workers: int, save) -> None:
-    """Retry failed commits through the normal synchronous scorer."""
+def sync_fallback(client, storage, state: dict, settings, workers: int, save,
+                  flush_every: int = SYNC_FLUSH_EVERY) -> None:
+    """Retry failed commits through the normal synchronous scorer.
+
+    Results are written and the state saved every *flush_every* commits (and on
+    the way out of any error or interrupt), so a killed run keeps what it paid
+    for and the next run converges. All storage access stays on this thread.
+    """
     existing = storage.get_existing_shas(state["commit_table"])
     for sha in [s for s in state["failed"] if s in existing]:
         del state["failed"][sha]  # written by an earlier run that died before saving
@@ -312,28 +374,44 @@ def sync_fallback(client, storage, state: dict, settings, workers: int, save) ->
           flush=True)
 
     # DuckDB connections are not thread-safe: read on the main thread.
-    inputs = [(_commit(storage, sha), _diffs(storage, sha)) for sha in todo]
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = list(pool.map(
-            lambda ci: scoring.score_and_build_rows(client, settings, ci[0], ci[1]),
-            inputs,
-        ))
+    inputs = {sha: (_commit(storage, sha), _diffs(storage, sha)) for sha in todo}
 
     commit_rows: list[dict] = []
     file_rows: list[dict] = []
-    for sha, (rows, outcome) in zip(todo, results):
-        state["tokens"]["sync_input"] += outcome.input_tokens
-        state["tokens"]["sync_output"] += outcome.output_tokens
-        if rows is None:
-            state["failed"][sha] = ",".join(outcome.failures) or "no_diffs"
-            continue
-        del state["failed"][sha]
-        commit_rows.append(rows["commit_row"])
-        file_rows.extend(rows["file_rows"])
-    _write_rows(storage, state, commit_rows, file_rows)
-    save()
-    print(f"  {len(todo) - sum(1 for s in todo if s in state['failed']):,} recovered, "
-          f"{sum(1 for s in todo if s in state['failed']):,} still unscored.", flush=True)
+    recovered = 0
+
+    def flush() -> None:
+        _write_rows(storage, state, commit_rows, file_rows)
+        save()
+
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {
+            pool.submit(scoring.score_and_build_rows, client, settings, commit, diffs): sha
+            for sha, (commit, diffs) in inputs.items()
+        }
+        for fut in as_completed(futures):
+            sha = futures[fut]
+            try:
+                rows, outcome = fut.result()
+            except Exception:  # noqa: BLE001 - one bad commit must not stop the rest
+                state["failed"][sha] = "error"
+                continue
+            state["tokens"]["sync_input"] += outcome.input_tokens
+            state["tokens"]["sync_output"] += outcome.output_tokens
+            if rows is None:
+                state["failed"][sha] = ",".join(outcome.failures) or "no_diffs"
+                continue
+            del state["failed"][sha]
+            recovered += 1
+            commit_rows.append(rows["commit_row"])
+            file_rows.extend(rows["file_rows"])
+            if len(commit_rows) >= flush_every:
+                flush()
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+        flush()
+    print(f"  {recovered:,} recovered, {len(todo) - recovered:,} still unscored.", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +527,7 @@ def _new_state(storage, settings: scoring.ScoringSettings, config: Config) -> di
 
 def run(config: Config, args: argparse.Namespace) -> int:
     path = state_path(config)
-    settings = scoring.settings_from_config(config)
+    settings = scoring.settings_or_exit(config)
 
     storage = get_storage(config)
     storage.create_tables()  # also adds provenance columns to older tables
