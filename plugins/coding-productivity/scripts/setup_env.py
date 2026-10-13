@@ -144,7 +144,7 @@ def setup() -> Path:
             if "SCORING_ENABLED=true" in cfg_text:
                 print("Installing anthropic (scoring enabled)...")
                 subprocess.check_call(
-                    [vpy, "-m", "pip", "install", "anthropic"],
+                    [vpy, "-m", "pip", "install", "anthropic>=1.13"],
                     stdout=subprocess.DEVNULL,
                 )
             if "STORAGE_BACKEND=bigquery" in cfg_text:

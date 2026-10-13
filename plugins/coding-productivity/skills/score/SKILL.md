@@ -1,11 +1,13 @@
 ---
 name: coding-productivity:score
-description: 'Score commits using Claude Haiku to measure intellectual value and categorize changes. Use after extraction to add AI-powered productivity metrics. Requires an Anthropic API key.'
+description: 'Score commits with the configured Claude model (SCORING_MODEL) to measure intellectual value and categorize changes. Use after extraction to add AI-powered productivity metrics. Requires an Anthropic API key.'
 ---
 
 # Score Commits
 
-This skill runs AI-powered commit scoring using Claude Haiku. It evaluates each file in every commit on a 0.0-1.0 scale measuring intellectual effort, then writes results to the `commit_scores` and `file_scores` tables.
+This skill runs AI-powered commit scoring with the model named in `SCORING_MODEL` (default written by setup: `claude-haiku-5-5`). It evaluates each file in every commit on a 0.0-1.0 scale measuring intellectual effort, then writes results to the active scoring series (`commit_scores` / `file_scores`, or the `commit_scores_v{N}` tables a rebase activated). Every row records the `scorer_model` and `prompt_version` that produced it.
+
+The scoring model is a measuring instrument: one series = one model. The plugin never picks a model on its own. To change the model, use `/coding-productivity:calibrate` and then `/coding-productivity:rebase`.
 
 **Important:** Use `AskUserQuestion` for every interactive prompt. Never assume answers or skip steps.
 
@@ -21,7 +23,7 @@ Read `.coding-productivity.env` and check the `SCORING_ENABLED` value.
 
 Tell the user:
 
-> Commit scoring is currently disabled in your configuration. Scoring uses the Anthropic API (Claude Haiku) to evaluate each commit's intellectual value on a 0.0-1.0 scale.
+> Commit scoring is currently disabled in your configuration. Scoring uses the Anthropic API (a Claude model, `claude-haiku-5-5` by default) to evaluate each commit's intellectual value on a 0.0-1.0 scale.
 
 Ask via `AskUserQuestion`:
 
@@ -38,6 +40,8 @@ If "No": stop and display:
 
 **If `SCORING_ENABLED=true` but `ANTHROPIC_API_KEY` is not set:** tell the user their API key is missing and suggest running `/coding-productivity:setup` to configure it. Stop.
 
+**If `SCORING_ENABLED=true` but `SCORING_MODEL` is not set:** tell the user the model must now be explicit, and suggest running `/coding-productivity:setup` (AI Scoring section) or adding `SCORING_MODEL=claude-haiku-5-5` to `.coding-productivity.env`. If scores already exist from an earlier plugin version, they carry no recorded model: the user should set `SCORING_MODEL` to the model that produced them (the newest Haiku available at the time of scoring), not to the newest model. Stop.
+
 ## Step 2: Count Unscored Commits
 
 Run via Bash to check how many commits need scoring:
@@ -47,10 +51,11 @@ python3.14 -c "
 import sys; sys.path.insert(0, 'scripts')
 from lib.config import Config
 from lib.storage import get_storage
+from lib.scoring_meta import get_active
 cfg = Config()
 st = get_storage(cfg)
 total = st.count('commits')
-scored = st.count('commit_scores')
+scored = st.count(get_active(st).commit_table)
 unscored = total - scored
 print(f'TOTAL={total}')
 print(f'SCORED={scored}')
@@ -83,7 +88,7 @@ Check whether the file `.coding-productivity/.scoring_consent` exists.
 
 > **Data Classification Notice**
 >
-> Commit scoring sends file diffs and commit metadata to the Anthropic API (Claude Haiku) for evaluation. The data is processed according to Anthropic's API Terms of Service and is NOT used for model training.
+> Commit scoring sends file diffs and commit metadata to the Anthropic API (Claude) for evaluation. The data is processed according to Anthropic's API Terms of Service and is NOT used for model training.
 >
 > **What is sent:** file paths, diff content (truncated to ~10 KB per file), commit titles and messages, line-change counts.
 >
@@ -118,6 +123,8 @@ Wait for completion. If the script exits with an error, display the error and su
 - **Rate limit errors**: suggest reducing `--workers` to 3-5
 - **Authentication errors**: suggest checking the API key via `/coding-productivity:setup`
 - **No commits to score**: this is normal if all commits were already scored
+- **"SCORING_MODEL=... but the active scoring series was built with ..."**: the config model differs from the model of the active series. Mixing models inside one series breaks trends, so scoring refuses. Either set `SCORING_MODEL` back, or run `/coding-productivity:calibrate` and `/coding-productivity:rebase` to move the whole series to the new model
+- **"WARNING: a newer Haiku is available"**: informational. Scoring continues with `SCORING_MODEL`. Never switch models by editing the config alone; run `/coding-productivity:calibrate` first
 
 ## Step 5: Show Summary
 
@@ -126,6 +133,7 @@ After the script completes, display its summary output which includes:
 - Average weighted score
 - Total productivity points
 - Category breakdown (feature, bugfix, refactor, etc.)
+- A per-month failure table: commits left unscored after retries and the failed-attempt reasons (`refusal`, `max_tokens`, `invalid_json`, `rate_limit`, `api_error`). Re-run the skill to retry unscored commits
 
 If the summary is not printed by the script (e.g., the output was too long), query the results directly:
 
@@ -134,14 +142,16 @@ python3.14 -c "
 import sys; sys.path.insert(0, 'scripts')
 from lib.config import Config
 from lib.storage import get_storage
+from lib.scoring_meta import get_active
 cfg = Config()
 st = get_storage(cfg)
-scored = st.count('commit_scores')
-rows = st.query('SELECT overall_category, COUNT(*) as cnt, AVG(weighted_score) as avg_score FROM commit_scores GROUP BY overall_category ORDER BY cnt DESC')
+ct = get_active(st).commit_table
+scored = st.count(ct)
+rows = st.query(f'SELECT overall_category, COUNT(*) as cnt, AVG(weighted_score) as avg_score FROM {ct} GROUP BY overall_category ORDER BY cnt DESC')
 print(f'Total scored commits: {scored}')
 for r in rows:
     print(f\"  {r['overall_category']:<16} {r['cnt']:>5}  avg={r['avg_score']:.2f}\")
-avg = st.query('SELECT AVG(weighted_score) as avg FROM commit_scores')
+avg = st.query(f'SELECT AVG(weighted_score) as avg FROM {ct}')
 print(f\"Overall average score: {avg[0]['avg']:.2f}\")
 st.close()
 "

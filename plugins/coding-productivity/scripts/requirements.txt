@@ -6,4 +6,4 @@ python-dotenv
 
 # Optional extras (install manually if needed):
 #   google-cloud-bigquery   — BigQuery storage backend
-#   anthropic               — AI-powered commit scoring
+#   anthropic>=1.13         — AI-powered commit scoring and rebase (Message Batches)

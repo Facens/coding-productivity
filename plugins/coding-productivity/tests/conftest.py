@@ -100,3 +100,14 @@ def sample_scores():
             "scored_at": "2026-03-27T00:00:00Z",
         },
     ]
+
+
+@pytest.fixture
+def sample_diffs():
+    """One diff per sample commit."""
+    return [
+        {"commit_sha": "abc123def456", "file_path": "src/auth.py", "additions": 50,
+         "deletions": 10, "diff": "+def login(): pass"},
+        {"commit_sha": "def456abc789", "file_path": "src/login.py", "additions": 5,
+         "deletions": 3, "diff": "+fix"},
+    ]

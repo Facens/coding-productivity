@@ -22,11 +22,12 @@ python3.14 -c "
 import sys; sys.path.insert(0, 'scripts')
 from lib.config import Config
 from lib.storage import get_storage
+from lib.scoring_meta import get_active
 cfg = Config()
 st = get_storage(cfg)
 commits = st.count('commits')
 try:
-    scores = st.count('commit_scores')
+    scores = st.count(get_active(st).commit_table)
 except:
     scores = 0
 print(f'COMMITS:{commits}')
@@ -94,6 +95,14 @@ python3.14 scripts/analyze.py --config .coding-productivity.env \
 ## Step 5: Display Results
 
 Present the script output directly. It is already formatted as markdown tables.
+
+If the script exits with a message that the date range mixes scoring models (or mixes legacy scores with a recorded model), do not work around it. Explain that a trend across two models is a trend in the instrument, and offer:
+
+> 1. Narrow the date range to one model
+> 2. Rescore everything with one model: `/coding-productivity:calibrate`, then `/coding-productivity:rebase`
+> 3. If the legacy scores (no recorded model) are known to come from the same model as the rest, re-run with `--allow-legacy-null`
+
+`--allow-legacy-null` only relaxes NULL-plus-one-model; more than one recorded model is always refused.
 
 If no scoring data exists and the user ran a score-dependent query (category_distribution), explain:
 > Category distribution requires AI scoring data. Run `/coding-productivity:score` first to generate commit scores.

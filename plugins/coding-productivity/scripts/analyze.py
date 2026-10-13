@@ -32,6 +32,7 @@ from pathlib import Path
 # Ensure the lib package is importable when running as a script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from lib import scoring_meta
 from lib.config import Config
 from lib.storage import get_storage, Storage
 
@@ -92,13 +93,95 @@ def _build_where(config: Config, since: str, until: str,
     return "WHERE " + " AND ".join(clauses), params
 
 
+def _commit_scores_table(storage: Storage) -> str:
+    """Name of the active series' commit score table (see lib/scoring_meta.py)."""
+    return scoring_meta.get_active(storage).commit_table
+
+
 def _has_scores(storage: Storage) -> bool:
-    """Check whether the commit_scores table has any data."""
+    """Check whether the active commit score table has any data."""
     try:
-        rows = storage.query("SELECT COUNT(*) AS cnt FROM commit_scores")
+        rows = storage.query(
+            f"SELECT COUNT(*) AS cnt FROM {_commit_scores_table(storage)}"
+        )
         return rows[0]["cnt"] > 0 if rows else False
     except Exception:
         return False
+
+
+class MixedScorerModelError(RuntimeError):
+    """The selected date range mixes scores from different scoring models."""
+
+
+def check_single_scorer_model(storage: Storage, config: Config,
+                              ranges: list[tuple[str, str]],
+                              allow_legacy_null: bool = False) -> None:
+    """Refuse to analyze scores produced by more than one model.
+
+    The scoring model is a measuring instrument: a trend across two models is
+    a trend in the instrument. Raises ``MixedScorerModelError`` when the scored
+    commits in *ranges* (``[since, until)`` pairs, as used by the queries) have
+
+    * more than one distinct non-NULL ``scorer_model``, or
+    * NULL plus non-NULL ``scorer_model`` (legacy rows predate provenance),
+      unless *allow_legacy_null* is set.
+    """
+    table = _commit_scores_table(storage)
+
+    range_sql = " OR ".join(
+        f"(c.authored_date >= $since_{i} AND c.authored_date < $until_{i})"
+        for i in range(len(ranges))
+    )
+    params: dict = {}
+    for i, (since, until) in enumerate(ranges):
+        params[f"since_{i}"] = since
+        params[f"until_{i}"] = until
+
+    clauses = [f"({range_sql})"]
+    repo_clause, repo_params = _repo_filter(config)
+    if repo_clause:
+        clauses.append(repo_clause)
+        params.update(repo_params)
+    excl_clause, excl_params = _excluded_devs_filter(config)
+    if excl_clause:
+        clauses.append(excl_clause)
+        params.update(excl_params)
+
+    sql = f"""
+    SELECT s.scorer_model AS scorer_model, COUNT(*) AS n
+    FROM commits c
+    JOIN {table} s ON c.commit_sha = s.commit_sha
+    WHERE {" AND ".join(clauses)}
+    GROUP BY s.scorer_model
+    """
+    try:
+        rows = storage.query(sql, params)
+    except Exception as exc:
+        # A table created before provenance existed has no scorer_model column
+        # (e.g. a read-only connection never ran create_tables): all NULL.
+        if "scorer_model" not in str(exc):
+            raise
+        return
+
+    models = sorted(r["scorer_model"] for r in rows if r["scorer_model"] is not None)
+    null_count = sum(r["n"] for r in rows if r["scorer_model"] is None)
+
+    if len(models) > 1:
+        raise MixedScorerModelError(
+            "The selected date range contains scores from more than one scoring "
+            f"model ({', '.join(models)}). A trend across models is a trend in "
+            "the instrument, not in productivity. Narrow the range to one model, "
+            "or rescore everything with one model: /coding-productivity:calibrate "
+            "then /coding-productivity:rebase."
+        )
+    if models and null_count and not allow_legacy_null:
+        raise MixedScorerModelError(
+            f"The selected date range mixes {null_count} legacy score(s) with no "
+            f"recorded model and scores from {models[0]}. Legacy rows predate "
+            "provenance, so the model that produced them is unknown. If you know "
+            "they came from the same model, re-run with --allow-legacy-null; "
+            "otherwise rescore with /coding-productivity:rebase."
+        )
 
 
 # ── Query functions ──────────────────────────────────────────────────────────
@@ -107,6 +190,7 @@ def monthly_trends(storage: Storage, config: Config,
                    since: str, until: str) -> list[dict]:
     """Monthly commit count, total productivity, avg weighted score, unique authors."""
     scored = _has_scores(storage)
+    scores = _commit_scores_table(storage)
     where, params = _build_where(config, since, until)
 
     if scored:
@@ -118,7 +202,7 @@ def monthly_trends(storage: Storage, config: Config,
             ROUND(COALESCE(SUM(s.total_productivity), 0), 2) AS total_productivity,
             ROUND(COALESCE(AVG(s.weighted_score), 0), 3) AS avg_weighted_score
         FROM commits c
-        LEFT JOIN commit_scores s ON c.commit_sha = s.commit_sha
+        LEFT JOIN {scores} s ON c.commit_sha = s.commit_sha
         {where}
         GROUP BY date_trunc('month', c.authored_date)
         ORDER BY month
@@ -144,6 +228,7 @@ def period_comparison(storage: Storage, config: Config,
                       comparison_start: str, comparison_end: str) -> list[dict]:
     """Before/after metrics with percentage change."""
     scored = _has_scores(storage)
+    scores = _commit_scores_table(storage)
 
     # Build repo and exclusion filters once.
     repo_clause, repo_params = _repo_filter(config)
@@ -175,7 +260,7 @@ def period_comparison(storage: Storage, config: Config,
                 ROUND(COALESCE(AVG(s.weighted_score), 0), 3) AS avg_weighted_score,
                 COUNT(DISTINCT CAST(c.authored_date AS DATE)) AS active_days
             FROM commits c
-            LEFT JOIN commit_scores s ON c.commit_sha = s.commit_sha
+            LEFT JOIN {scores} s ON c.commit_sha = s.commit_sha
             WHERE c.authored_date >= $b_start AND c.authored_date < $b_end
                   {extra_sql}
         ),
@@ -187,7 +272,7 @@ def period_comparison(storage: Storage, config: Config,
                 ROUND(COALESCE(AVG(s.weighted_score), 0), 3) AS avg_weighted_score,
                 COUNT(DISTINCT CAST(c.authored_date AS DATE)) AS active_days
             FROM commits c
-            LEFT JOIN commit_scores s ON c.commit_sha = s.commit_sha
+            LEFT JOIN {scores} s ON c.commit_sha = s.commit_sha
             WHERE c.authored_date >= $c_start AND c.authored_date < $c_end
                   {extra_sql}
         )
@@ -260,6 +345,7 @@ def author_productivity(storage: Storage, config: Config,
                         since: str, until: str, limit: int = 20) -> list[dict]:
     """Per-author: commits, total productivity, avg score, top category."""
     scored = _has_scores(storage)
+    scores = _commit_scores_table(storage)
     where, params = _build_where(config, since, until)
     params["lim"] = limit
 
@@ -273,7 +359,7 @@ def author_productivity(storage: Storage, config: Config,
                 ROUND(COALESCE(SUM(s.total_productivity), 0), 2) AS total_productivity,
                 ROUND(COALESCE(AVG(s.weighted_score), 0), 3) AS avg_weighted_score
             FROM commits c
-            LEFT JOIN commit_scores s ON c.commit_sha = s.commit_sha
+            LEFT JOIN {scores} s ON c.commit_sha = s.commit_sha
             {where}
             GROUP BY c.author_name, c.author_email
         ),
@@ -286,7 +372,7 @@ def author_productivity(storage: Storage, config: Config,
                     PARTITION BY c.author_email ORDER BY COUNT(*) DESC
                 ) AS rn
             FROM commits c
-            JOIN commit_scores s ON c.commit_sha = s.commit_sha
+            JOIN {scores} s ON c.commit_sha = s.commit_sha
             {where}
             GROUP BY c.author_email, s.overall_category
         )
@@ -330,7 +416,7 @@ def merge_velocity(storage: Storage, config: Config,
 
     # Adapt filters for MR table aliases (m instead of c).
     # MR project_name stores short names (e.g., "admin"), not full paths
-    # (e.g., "team-blue-Hub/admin"). Rebuild repo params with short names.
+    # (e.g., "org/admin"). Rebuild repo params with short names.
     if repo_clause:
         mr_repo_params = {k: v.split("/")[-1] if "/" in v else v
                           for k, v in repo_params.items()}
@@ -393,6 +479,7 @@ def category_distribution(storage: Storage, config: Config,
     if not _has_scores(storage):
         return []
 
+    scores = _commit_scores_table(storage)
     where, params = _build_where(config, since, until)
 
     sql = f"""
@@ -402,7 +489,7 @@ def category_distribution(storage: Storage, config: Config,
             COUNT(*) AS commit_count,
             ROUND(AVG(s.weighted_score), 3) AS avg_score
         FROM commits c
-        JOIN commit_scores s ON c.commit_sha = s.commit_sha
+        JOIN {scores} s ON c.commit_sha = s.commit_sha
         {where}
         GROUP BY s.overall_category
     ),
@@ -549,6 +636,24 @@ QUERIES = {
 }
 
 
+# Queries that read score tables (and so need the single-model guard).
+SCORE_QUERIES = {
+    "monthly_trends", "period_comparison", "author_productivity",
+    "category_distribution",
+}
+
+
+def _period_ranges(args) -> list[tuple[str, str]]:
+    """Baseline and comparison windows, when all four dates were given."""
+    if not (args.baseline_start and args.baseline_end
+            and args.comparison_start and args.comparison_end):
+        return []  # the per-query argument check reports the missing flags
+    return [
+        (args.baseline_start, args.baseline_end),
+        (args.comparison_start, args.comparison_end),
+    ]
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -577,6 +682,12 @@ def main():
     parser.add_argument("--comparison-start", help="Comparison period start (YYYY-MM-DD).")
     parser.add_argument("--comparison-end", help="Comparison period end (YYYY-MM-DD).")
     parser.add_argument("--limit", type=int, default=20, help="Row limit for author query.")
+    parser.add_argument(
+        "--allow-legacy-null", action="store_true",
+        help="Allow scores with no recorded model (legacy rows, written before "
+             "provenance existed) next to scores from a single model. More than "
+             "one recorded model is always refused.",
+    )
 
     args = parser.parse_args()
 
@@ -589,6 +700,22 @@ def main():
             query_names = [q for q in QUERIES if q != "period_comparison"]
         else:
             query_names = [args.query]
+
+        # One series = one model: refuse mixed-model score ranges up front.
+        if any(q in SCORE_QUERIES for q in query_names) and _has_scores(storage):
+            if "period_comparison" in query_names:
+                ranges = _period_ranges(args)
+            else:
+                ranges = [(args.since, args.until)] if args.since and args.until else []
+            if ranges:
+                try:
+                    check_single_scorer_model(
+                        storage, config, ranges,
+                        allow_legacy_null=args.allow_legacy_null,
+                    )
+                except MixedScorerModelError as exc:
+                    print(f"Error: {exc}", file=sys.stderr)
+                    sys.exit(2)
 
         for qname in query_names:
             if qname == "period_comparison":

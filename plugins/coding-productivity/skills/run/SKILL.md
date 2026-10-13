@@ -66,6 +66,8 @@ If `SCORING_ENABLED=true` in config:
 
 Show scoring progress. This may take several minutes for large datasets.
 
+The model is `SCORING_MODEL` from the config; the script refuses to append scores from a different model than the active series. If it exits with that error, do not edit the config to get around it: point the user to `/coding-productivity:calibrate` and `/coding-productivity:rebase`.
+
 If scoring is disabled, skip this step and tell the user:
 > Scoring is disabled. Run `/coding-productivity:setup` to enable it, or use `/coding-productivity:analyze` for raw metrics.
 
@@ -81,6 +83,8 @@ Run all analysis queries:
 ```
 
 Display all results to the user as markdown tables.
+
+If an analysis exits with an error that the date range mixes scoring models, stop and explain it (a trend across two models is a trend in the instrument). Offer a narrower range, or `/coding-productivity:calibrate` then `/coding-productivity:rebase`.
 
 ## Step 6: Summary
 

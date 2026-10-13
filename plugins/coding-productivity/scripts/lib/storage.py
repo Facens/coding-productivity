@@ -35,6 +35,14 @@ class Storage(abc.ABC):
     def count(self, table: str) -> int: ...
 
     @abc.abstractmethod
+    def list_tables(self) -> set[str]:
+        """Names of all tables that currently exist in the store."""
+
+    @abc.abstractmethod
+    def ensure_table(self, table: str) -> None:
+        """Create *table* (a known or versioned score table) if missing."""
+
+    @abc.abstractmethod
     def close(self) -> None: ...
 
     # Context-manager support
@@ -79,6 +87,46 @@ class DuckDBStorage(Storage):
             for table_name in _schema.SCHEMAS:
                 ddl = _schema.get_create_sql(table_name)
                 self._conn.execute(ddl)
+            self._migrate_columns(
+                list(_schema.SCHEMAS)
+                + sorted(_schema.versioned_score_tables(self.list_tables()))
+            )
+
+    def _existing_columns(self, table: str) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'main' AND table_name = ?",
+            [table],
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def _migrate_columns(self, tables: list[str]) -> None:
+        """Add columns that the current schema defines but the table lacks.
+
+        Lets installs created by an older plugin version keep working: old
+        rows get NULL in the new columns.
+        """
+        for table in tables:
+            have = self._existing_columns(table)
+            for col, dtype in _schema.get_column_types(table).items():
+                if col not in have:
+                    # Identifiers come from the schema whitelist, not user input.
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {dtype}"
+                    )
+
+    def list_tables(self) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'main'"
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def ensure_table(self, table: str) -> None:
+        self._assert_writable()
+        ddl = _schema.get_create_sql(table)  # validates the table name
+        with self._lock:
+            self._conn.execute(ddl)
 
     def insert_batch(self, table: str, records: list[dict[str, Any]]) -> None:
         self._assert_writable()
@@ -178,24 +226,62 @@ class BigQueryStorage(Storage):
         self._assert_writable()
         from google.cloud import bigquery as bq
 
-        # Map DuckDB types to BigQuery types
-        type_map = {
-            "VARCHAR": "STRING",
-            "TEXT": "STRING",
-            "INTEGER": "INTEGER",
-            "DOUBLE": "FLOAT64",
-            "TIMESTAMP": "TIMESTAMP",
-            "BOOLEAN": "BOOLEAN",
-        }
-
         for table_name, columns in _schema.SCHEMAS.items():
             ref = self._table_ref(table_name)
             bq_schema = [
-                bq.SchemaField(col, type_map.get(dtype, "STRING"))
+                bq.SchemaField(col, self._TYPE_MAP.get(dtype, "STRING"))
                 for col, dtype in columns.items()
             ]
             table = bq.Table(ref, schema=bq_schema)
             self._client.create_table(table, exists_ok=True)
+
+        self._migrate_columns(
+            list(_schema.SCHEMAS)
+            + sorted(_schema.versioned_score_tables(self.list_tables()))
+        )
+
+    _TYPE_MAP = {
+        "VARCHAR": "STRING",
+        "TEXT": "STRING",
+        "INTEGER": "INTEGER",
+        "DOUBLE": "FLOAT64",
+        "TIMESTAMP": "TIMESTAMP",
+        "BOOLEAN": "BOOLEAN",
+    }
+
+    def _migrate_columns(self, tables: list[str]) -> None:
+        """Append schema columns missing from existing tables (nullable)."""
+        from google.cloud import bigquery as bq
+
+        for table_name in tables:
+            table = self._client.get_table(self._table_ref(table_name))
+            have = {f.name for f in table.schema}
+            missing = [
+                bq.SchemaField(col, self._TYPE_MAP.get(dtype, "STRING"), mode="NULLABLE")
+                for col, dtype in _schema.get_column_types(table_name).items()
+                if col not in have
+            ]
+            if missing:
+                table.schema = list(table.schema) + missing
+                self._client.update_table(table, ["schema"])
+
+    def list_tables(self) -> set[str]:
+        return {
+            t.table_id
+            for t in self._client.list_tables(f"{self._project}.{self._dataset}")
+        }
+
+    def ensure_table(self, table: str) -> None:
+        self._assert_writable()
+        from google.cloud import bigquery as bq
+
+        bq_schema = [
+            bq.SchemaField(col, self._TYPE_MAP.get(dtype, "STRING"))
+            for col, dtype in _schema.get_column_types(table).items()
+        ]
+        self._client.create_table(
+            bq.Table(self._table_ref(table), schema=bq_schema), exists_ok=True
+        )
 
     def insert_batch(self, table: str, records: list[dict[str, Any]]) -> None:
         self._assert_writable()
@@ -223,12 +309,16 @@ class BigQueryStorage(Storage):
     def query(self, sql: str, params: Optional[dict] = None) -> list[dict[str, Any]]:
         from google.cloud import bigquery as bq
 
-        job_config = None
+        # Default dataset lets unqualified table names (as used by the
+        # analysis and scoring SQL) resolve against the configured dataset.
+        job_config = bq.QueryJobConfig(
+            default_dataset=f"{self._project}.{self._dataset}"
+        )
         if params:
             query_params = [
                 bq.ScalarQueryParameter(k, "STRING", v) for k, v in params.items()
             ]
-            job_config = bq.QueryJobConfig(query_parameters=query_params)
+            job_config.query_parameters = query_params
 
         result = self._client.query(sql, job_config=job_config).result()
         return [dict(row) for row in result]

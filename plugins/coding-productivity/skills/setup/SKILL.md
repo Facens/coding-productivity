@@ -122,7 +122,18 @@ Enable AI commit scoring? (uses Anthropic API, costs ~$0.001/commit)
 2. Yes - Score each commit's intellectual value with Claude Haiku
 ```
 
-If Yes: ask for Anthropic API key, validate with curl.
+If Yes: ask for Anthropic API key, validate with curl. Then ask for the scoring model:
+
+```
+Which model should score commits?
+
+1. claude-haiku-5-5 (Recommended) - Default. Low cost, medium effort
+2. Another model ID - I'll provide one
+```
+
+Explain in one line: the scoring model is a measuring instrument. It is fixed in the config, never auto-selected, and changing it later means rescoring everything (`/coding-productivity:calibrate`, then `/coding-productivity:rebase`).
+
+Write `SCORING_EFFORT=medium` and `SCORING_MAX_TOKENS=16000` unless the user asks for other values (effort: low, medium, high, xhigh or max; ignored by `claude-haiku-4*` models, which take neither adaptive thinking nor effort).
 
 ## Step 5: Write Config and Confirm
 
@@ -150,6 +161,9 @@ GOOGLE_APPLICATION_CREDENTIALS={google_creds_path}
 
 SCORING_ENABLED={true_or_false}
 ANTHROPIC_API_KEY={anthropic_key}
+SCORING_MODEL={scoring_model_or_empty}
+SCORING_EFFORT=medium
+SCORING_MAX_TOKENS=16000
 
 ANONYMIZATION_ENABLED={true_or_false}
 PSEUDONYMIZATION_KEY={key_or_empty}
@@ -183,6 +197,7 @@ Repositories:   {count} selected
 Storage:        {backend}
 Anonymization:  {Enabled/Disabled}
 AI Scoring:     {Enabled/Disabled}
+Scoring model:  {scoring_model}
 ```
 
 If anonymization enabled:
@@ -221,5 +236,7 @@ For each section, re-run the corresponding step from above. Important edge cases
 - **Anonymization**: Check if data exists first (`count commits in storage`). If commits > 0, display as **locked**: "Cannot change while data exists. Delete .coding-productivity/data.duckdb and re-extract to change."
 - **Storage backend switch**: Warn "Switching does not migrate data. You'll need to re-extract."
 - **Repo removal**: "Removing a repo does not delete existing data. Analysis filters by active repos."
+- **AI Scoring model change**: if scores already exist (`count commit_scores > 0`), do not just rewrite `SCORING_MODEL`. Warn: "Changing the scoring model changes the score scale. Existing scores stay on the old model, and the plugin refuses to mix models in one series. Run `/coding-productivity:calibrate` to compare the models, then `/coding-productivity:rebase` to rescore everything." Only change the value if the user confirms, or if they are correcting it to the model that actually produced the existing scores.
+- **Existing install without `SCORING_MODEL`**: scoring now requires it. Ask which model produced the existing scores (the newest Haiku available when they were scored) and write that, not the newest model.
 
 After each modification, save config, show updated summary, and return to section selection.
