@@ -540,7 +540,7 @@ def test_post_processing_values_are_pinned():
     """If this fails you changed scoring post-processing. That changes every
     score: bump scoring.SCORING_LOGIC_VERSION (so prompt_version changes and
     existing series stop being extended), then update the pinned value."""
-    assert scoring.logic_values_fingerprint() == "23ce0a7c12f8"
+    assert scoring.logic_values_fingerprint() == "e5530b1404e4"
 
 
 def test_post_processing_behaviour_is_pinned():
@@ -900,3 +900,49 @@ def test_batch_rows_record_the_first_level(rebase_env_factory):
     env.run(env.client(env.FakeBatches(), make_response(FILES_A)))
     rows = env.storage.query("SELECT diff_chars FROM commit_scores_v2")
     assert len(rows) == 2 and {r["diff_chars"] for r in rows} == {10_000}
+
+
+# ── Duplicate paths: the first entry per file wins ───────────────────────────
+
+TWO_FILES = [{"file_path": "src/a.py", "additions": 10, "deletions": 5},
+             {"file_path": "src/b.py", "additions": 20, "deletions": 0}]
+
+
+def test_duplicate_paths_keep_the_first_entry_and_are_counted():
+    payload = {"files": [
+        {"path": "src/a.py", "score": 0.8, "category": "feature"},
+        {"path": "src/b.py", "score": 0.5, "category": "bugfix"},
+        {"path": "src/a.py", "score": 0.1, "category": "chore"},   # repeat: dropped
+        {"path": "src/a.py", "score": 0.9, "category": "docs"},    # repeat: dropped
+    ]}
+    result, reason = scoring.evaluate_response(text_response(payload))
+    assert reason is None
+    assert [(f["path"], f["score"]) for f in result["files"]] == [("src/a.py", 0.8), ("src/b.py", 0.5)]
+    assert result["dropped_files"] == 2  # same counter as other dropped entries
+
+
+def test_an_invalid_first_entry_does_not_shadow_a_valid_repeat():
+    payload = {"files": [{"path": "src/a.py", "score": None},
+                         {"path": "src/a.py", "score": 0.6}]}
+    result, _ = scoring.evaluate_response(text_response(payload))
+    assert [(f["path"], f["score"]) for f in result["files"]] == [("src/a.py", 0.6)]
+    assert result["dropped_files"] == 1
+
+
+def test_lines_and_file_rows_count_each_changed_file_once():
+    once = {"files": [{"path": "src/a.py", "score": 0.8, "category": "feature"},
+                      {"path": "src/b.py", "score": 0.5, "category": "bugfix"}]}
+    twice = {"files": once["files"] + [{"path": "src/a.py", "score": 0.8, "category": "feature"}]}
+    r1 = scoring.rows_from_result("s", once, TWO_FILES, "m", "pv")
+    r2 = scoring.rows_from_result("s", twice, TWO_FILES, "m", "pv")
+    assert r2["total_lines"] == r1["total_lines"] == 35  # sum of distinct changed files, not 50
+    assert r2["commit_row"]["total_productivity"] == r1["commit_row"]["total_productivity"]
+    assert r2["commit_row"]["weighted_score"] == r1["commit_row"]["weighted_score"]
+    paths = [(f["commit_sha"], f["file_path"]) for f in r2["file_rows"]]
+    assert len(paths) == len(set(paths)) == 2  # unique per (commit_sha, file_path)
+
+
+def test_duplicates_are_deduplicated_when_calling_calculate_productivity_directly():
+    raw = {"files": [{"path": "src/a.py", "score": 0.8}, {"path": "src/a.py", "score": 0.8}]}
+    p = scoring.calculate_productivity(raw, TWO_FILES)
+    assert p["total_lines"] == 15 and len(p["files"]) == 1

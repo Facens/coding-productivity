@@ -99,7 +99,7 @@ REASONING_MAX_CHARS = 1000
 # ``logic_values_fingerprint`` cannot see (apply_score_caps, how scores are
 # aggregated, normalization). tests/test_scoring.py pins golden outputs and
 # the fingerprint so a silent change fails the suite.
-SCORING_LOGIC_VERSION = 1
+SCORING_LOGIC_VERSION = 2  # 2: duplicate file paths in an answer keep the first entry only
 
 # Stop reasons that mean "no usable answer", even when the call succeeded.
 FAILED_STOP_REASONS = ("refusal", "max_tokens")
@@ -430,7 +430,8 @@ def normalize_score_result(result: Any) -> dict | None:
 
     ``files`` must be a list of objects with a non-empty string ``path`` and a
     numeric, finite ``score`` (clamped to [0, 1]). An entry that breaks that is
-    dropped and counted in ``dropped_files`` (the rest of the commit is kept).
+    dropped and counted in ``dropped_files`` (the rest of the commit is kept); so is
+    a repeated ``path`` (only the first valid entry per path is kept).
     If ``files`` itself is malformed or no valid entry remains, the answer
     cannot be trusted and callers treat it as ``invalid_json`` (retryable).
     Free-text fields are coerced; ``flags`` is flattened to strings.
@@ -442,6 +443,7 @@ def normalize_score_result(result: Any) -> dict | None:
         return None
 
     normalized: list[dict] = []
+    seen: set[str] = set()
     dropped = 0
     for f in files:
         # One bad entry costs that file, not the commit.
@@ -450,6 +452,12 @@ def normalize_score_result(result: Any) -> dict | None:
             dropped += 1
             continue
         path = f["path"]
+        if path in seen:
+            # Models sometimes list a file twice. Counting both would count its
+            # lines twice; the first valid entry wins.
+            dropped += 1
+            continue
+        seen.add(path)
         category = f.get("category")
         reasoning = f.get("reasoning")
         normalized.append({
