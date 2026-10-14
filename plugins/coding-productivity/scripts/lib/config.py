@@ -154,6 +154,28 @@ class Config:
         return self._get_bool("SCORING_ENABLED")
 
     @property
+    def SCORING_MODEL(self) -> str | None:
+        """Model that scores commits. Explicit on purpose: it is the
+        measuring instrument, and changing it changes the scale."""
+        val = self._get("SCORING_MODEL")
+        return val.strip() if val and val.strip() else None
+
+    @property
+    def SCORING_EFFORT(self) -> str:
+        val = self._get("SCORING_EFFORT")
+        return val.strip().lower() if val and val.strip() else "medium"
+
+    @property
+    def SCORING_MAX_TOKENS(self) -> int:
+        val = self._get("SCORING_MAX_TOKENS")
+        if not val or not val.strip():
+            return 16000
+        try:
+            return int(val.strip())
+        except ValueError:
+            return -1  # reported by validate()
+
+    @property
     def ANTHROPIC_API_KEY(self) -> str | None:
         return self._get("ANTHROPIC_API_KEY")
 
@@ -223,6 +245,28 @@ class Config:
 
         if self.SCORING_ENABLED and not self.ANTHROPIC_API_KEY:
             errors.append("ANTHROPIC_API_KEY is required when SCORING_ENABLED=true.")
+        if self.SCORING_ENABLED:
+            if not self.SCORING_MODEL:
+                errors.append(
+                    "SCORING_MODEL is required when SCORING_ENABLED=true "
+                    "(e.g. SCORING_MODEL=claude-haiku-5-5). The plugin no longer "
+                    "picks the newest Haiku: a model change shifts the score "
+                    "scale. Scores written before this setting existed carry no "
+                    "model; use the model that produced them."
+                )
+            if self.SCORING_MODEL:
+                from . import scoring  # local import: scoring is optional-SDK aware
+                try:
+                    scoring.check_supported_model(self.SCORING_MODEL)
+                except scoring.UnsupportedModelError as exc:
+                    errors.append(str(exc))
+            if self.SCORING_EFFORT not in ("low", "medium", "high", "xhigh", "max"):
+                errors.append(
+                    "SCORING_EFFORT must be one of low, medium, high, xhigh, max, "
+                    f"got '{self.SCORING_EFFORT}'."
+                )
+            if self.SCORING_MAX_TOKENS < 1:
+                errors.append("SCORING_MAX_TOKENS must be a positive integer.")
 
         if self.ANONYMIZATION_ENABLED and not self.PSEUDONYMIZATION_KEY:
             errors.append(

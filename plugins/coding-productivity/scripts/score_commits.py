@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Score commits using Claude Haiku to measure intellectual value per file.
+Score commits using Claude to measure intellectual value per file.
 
 Reads unscored commits + diffs from the configured storage backend, sends each
-file's diff to Claude for evaluation, and writes results to the commit_scores
-and file_scores tables.
+file's diff to Claude for evaluation, and writes results to the *active*
+scoring series (``commit_scores`` / ``file_scores``, or the versioned tables a
+``rebase`` activated). Every row records the model and prompt that produced it.
+
+The model is ``SCORING_MODEL`` from the config; it is never auto-discovered.
+One series is one model. To change models, run ``calibrate`` and ``rebase``.
 
 Usage::
 
@@ -16,16 +20,11 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import json
-import os
-import re
 import sys
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Put scripts/lib on the import path so ``from lib import ...`` works when
@@ -34,375 +33,23 @@ from typing import Optional
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR))
 
+from lib import scoring, scoring_meta
+from lib import schema as _schema
 from lib.config import Config
 from lib.storage import get_storage, Storage
 
-# ---------------------------------------------------------------------------
-# Conditional import for Anthropic SDK
-# ---------------------------------------------------------------------------
-try:
-    import anthropic
-except ImportError:
-    print(
-        "Error: the 'anthropic' package is required for commit scoring.\n"
-        "Install it with:  pip install anthropic",
-        file=sys.stderr,
-    )
-    sys.exit(1)
 
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-_CONSENT_FILE = Path(".coding-productivity") / ".scoring_consent"
-
-VALID_CATEGORIES = {
-    "feature", "bugfix", "refactor", "test", "docs", "style",
-    "perf", "security", "deps", "config", "chore", "localization",
-}
-
-# Files auto-scored without an API call (pattern -> score).
-AUTO_SCORE_PATTERNS: dict[str, float] = {
-    # Lockfiles
-    r".*\.lock$": 0.0,
-    r"yarn\.lock$": 0.0,
-    r"Gemfile\.lock$": 0.0,
-    r"package-lock\.json$": 0.0,
-    r"pnpm-lock\.yaml$": 0.0,
-    r"composer\.lock$": 0.0,
-    r"Pipfile\.lock$": 0.0,
-    r"poetry\.lock$": 0.0,
-    r"Cargo\.lock$": 0.0,
-    # Minified files
-    r".*\.min\.js$": 0.0,
-    r".*\.min\.css$": 0.0,
-    # Source maps
-    r".*\.map$": 0.02,
-    # Generated / build output
-    r"^generated/.*": 0.0,
-    r"^dist/.*": 0.0,
-    r"^build/.*": 0.0,
-    r".*/generated/.*": 0.0,
-    r".*/dist/.*": 0.0,
-    r".*/build/.*": 0.0,
-    # Localization / translation files
-    r".*/locales/.*\.yml$": 0.05,
-    r".*/locales/.*\.yaml$": 0.05,
-    r".*/i18n/.*\.yml$": 0.05,
-    r".*/i18n/.*\.json$": 0.05,
-    r".*/translations/.*": 0.05,
-    # Config
-    r"\.gitignore$": 0.1,
-}
-
-# Post-processing score caps by extension.
-MAX_SCORE_BY_EXTENSION: dict[str, float] = {
-    ".md": 0.15,
-}
-
-# Large JSON files (> threshold lines, excluding package.json) are capped.
-LARGE_JSON_THRESHOLD = 500
-LARGE_JSON_MAX_SCORE = 0.05
-
-
-# ---------------------------------------------------------------------------
-# Load scoring prompt from references/
-# ---------------------------------------------------------------------------
-
-def _load_scoring_prompt() -> str:
-    """Read the scoring rubric shipped alongside this script."""
-    prompt_path = _SCRIPT_DIR.parent / "references" / "commit_scoring_prompt.md"
-    if not prompt_path.is_file():
+def _make_client(api_key: str):
+    try:
+        import anthropic
+    except ImportError:
         print(
-            f"Warning: scoring prompt not found at {prompt_path}; "
-            "using built-in fallback.",
+            "Error: the 'anthropic' package is required for commit scoring.\n"
+            "Install it with:  pip install anthropic",
             file=sys.stderr,
         )
-        return _FALLBACK_SYSTEM_PROMPT
-    return prompt_path.read_text(encoding="utf-8")
-
-
-_FALLBACK_SYSTEM_PROMPT = (
-    "You are an expert panel of 3 senior software engineers evaluating code "
-    "commits for a productivity analysis. Score each file from 0.0 to 1.0 "
-    "based on intellectual effort and value, NOT just lines of code."
-)
-
-
-# ---------------------------------------------------------------------------
-# Model discovery
-# ---------------------------------------------------------------------------
-
-_claude_model: str | None = None
-
-
-def _get_latest_haiku_model(client: anthropic.Anthropic) -> str:
-    """Auto-discover the latest Haiku model; fall back to a known ID."""
-    global _claude_model
-    if _claude_model:
-        return _claude_model
-
-    try:
-        models = client.models.list(limit=100)
-        for model in models.data:
-            if "haiku" in model.id.lower():
-                _claude_model = model.id
-                print(f"Using model: {model.display_name} ({model.id})")
-                return _claude_model
-    except Exception as exc:
-        print(f"Warning: could not list models ({exc}); using fallback.")
-
-    _claude_model = "claude-haiku-4-5-20251001"
-    print(f"Using fallback model: {_claude_model}")
-    return _claude_model
-
-
-# ---------------------------------------------------------------------------
-# Consent notice
-# ---------------------------------------------------------------------------
-
-def _ensure_consent() -> None:
-    """Display a one-time notice about sending diffs to the Anthropic API."""
-    if _CONSENT_FILE.is_file():
-        return
-
-    print()
-    print("=" * 70)
-    print("DATA CLASSIFICATION NOTICE")
-    print("=" * 70)
-    print(
-        "Commit scoring sends file diffs and commit metadata to the\n"
-        "Anthropic API (Claude Haiku) for evaluation. The data is processed\n"
-        "according to Anthropic's API Terms of Service and is NOT used for\n"
-        "model training.\n"
-        "\n"
-        "What is sent:\n"
-        "  - File paths and diff content (truncated to ~10 KB per file)\n"
-        "  - Commit titles and messages\n"
-        "  - Line-change counts\n"
-        "\n"
-        "What is NOT sent:\n"
-        "  - API tokens, credentials, or secrets\n"
-        "  - Full file contents (only diff hunks)\n"
-        "  - Developer names or emails\n"
-    )
-    print("=" * 70)
-    print()
-
-    _CONSENT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _CONSENT_FILE.write_text(
-        datetime.now(timezone.utc).isoformat(), encoding="utf-8"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Auto-scoring helpers
-# ---------------------------------------------------------------------------
-
-def _auto_score_file(file_path: str) -> float | None:
-    """Return a fixed score if the file matches a trivial pattern, else None."""
-    for pattern, score in AUTO_SCORE_PATTERNS.items():
-        if re.match(pattern, file_path, re.IGNORECASE):
-            return score
-    return None
-
-
-def _apply_score_caps(file_path: str, score: float, lines: int) -> float:
-    """Cap scores based on file type and size."""
-    _, ext = os.path.splitext(file_path.lower())
-
-    if ext in MAX_SCORE_BY_EXTENSION:
-        score = min(score, MAX_SCORE_BY_EXTENSION[ext])
-
-    if ext == ".json" and "package.json" not in file_path.lower():
-        if lines > LARGE_JSON_THRESHOLD:
-            score = min(score, LARGE_JSON_MAX_SCORE)
-
-    return score
-
-
-# ---------------------------------------------------------------------------
-# Diff utilities
-# ---------------------------------------------------------------------------
-
-def _truncate_diff(diff_content: str | None, max_chars: int = 10_000) -> str:
-    if not diff_content:
-        return ""
-    if len(diff_content) <= max_chars:
-        return diff_content
-    return diff_content[:max_chars] + "\n... [truncated]"
-
-
-# ---------------------------------------------------------------------------
-# Claude interaction
-# ---------------------------------------------------------------------------
-
-def _parse_json_response(text: str) -> dict | None:
-    """Extract a JSON object from Claude's response."""
-    clean = text.strip()
-
-    # Strip markdown code fences.
-    if "```" in clean:
-        m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", clean)
-        if m:
-            clean = m.group(1)
-        else:
-            clean = clean.replace("```json", "").replace("```", "")
-    clean = clean.strip()
-
-    try:
-        return json.loads(clean)
-    except json.JSONDecodeError:
-        pass
-
-    m = re.search(r"\{[\s\S]*\}", clean)
-    if m:
-        try:
-            return json.loads(m.group())
-        except json.JSONDecodeError:
-            pass
-
-    return None
-
-
-def _score_commit_with_claude(
-    client: anthropic.Anthropic,
-    system_prompt: str,
-    commit: dict,
-    diffs: list[dict],
-    max_retries: int = 3,
-) -> dict | None:
-    """Call Claude to score every file in a commit."""
-
-    file_list_lines = []
-    for d in diffs:
-        adds = d.get("additions") or 0
-        dels = d.get("deletions") or 0
-        file_list_lines.append(f"- {d['file_path']} (+{adds}/-{dels})")
-
-    def _build_prompt(diff_max: int) -> str:
-        parts = []
-        for d in diffs:
-            fp = d["file_path"]
-            auto = _auto_score_file(fp)
-            if auto is not None:
-                parts.append(f"### {fp}\n[Auto-scored: {auto} - lockfile/generated]")
-            else:
-                trunc = _truncate_diff(d.get("diff"), diff_max)
-                parts.append(f"### {fp}\n```diff\n{trunc}\n```")
-
-        return (
-            "Analyze this commit and score EACH FILE separately.\n\n"
-            f"**Commit Message:**\n{commit.get('title', '')}\n\n"
-            f"**Full Message:**\n{(commit.get('message') or commit.get('title', ''))[:500]}\n\n"
-            f"**Files Changed:**\n" + "\n".join(file_list_lines) + "\n\n"
-            f"**Diffs by File:**\n" + "\n".join(parts) + "\n\n"
-            "Respond with ONLY valid JSON (no markdown, no code blocks, just raw JSON):\n"
-            '{\n  "files": [\n    {\n      "path": "path/to/file.js",\n'
-            '      "score": 0.5,\n      "category": "feature",\n'
-            '      "reasoning": "brief explanation"\n    }\n  ],\n'
-            '  "overall_category": "feature",\n  "flags": []\n}'
-        )
-
-    diff_sizes = [10_000, 2_000, 1_000]
-    last_error: str | None = None
-
-    for attempt in range(max_retries):
-        diff_max = diff_sizes[min(attempt, len(diff_sizes) - 1)]
-        user_prompt = _build_prompt(diff_max)
-
-        try:
-            model = _get_latest_haiku_model(client)
-            response = client.messages.create(
-                model=model,
-                max_tokens=4096,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-            result = _parse_json_response(response.content[0].text)
-            if result and "files" in result:
-                return result
-            last_error = "Invalid JSON structure (missing 'files' key)"
-
-        except anthropic.RateLimitError:
-            wait = (2 ** attempt) * 2
-            time.sleep(wait)
-            last_error = "Rate limit"
-            continue
-
-        except anthropic.APIError as exc:
-            last_error = f"API error: {exc}"
-
-        except Exception as exc:
-            last_error = f"Unexpected error: {exc}"
-
-        if attempt < max_retries - 1:
-            time.sleep(0.5)
-
-    print(f"  Error after {max_retries} attempts: {last_error}")
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Productivity calculation
-# ---------------------------------------------------------------------------
-
-def _calculate_productivity(score_result: dict, diffs: list[dict]) -> dict | None:
-    """Aggregate per-file scores into commit-level productivity metrics."""
-    if not score_result or "files" not in score_result:
-        return None
-
-    diff_lines: dict[str, dict] = {}
-    for d in diffs:
-        adds = d.get("additions") or 0
-        dels = d.get("deletions") or 0
-        diff_lines[d["file_path"]] = {
-            "additions": adds,
-            "deletions": dels,
-            "total": adds + dels,
-        }
-
-    total_productivity = 0.0
-    total_lines = 0
-    file_scores: list[dict] = []
-
-    for fs in score_result["files"]:
-        path = fs["path"]
-        if path not in diff_lines:
-            continue
-
-        info = diff_lines[path]
-        lines = info["total"]
-        score = _apply_score_caps(path, fs["score"], lines)
-
-        # productivity = score * max(additions, 1)
-        productivity = score * max(info["additions"], 1)
-        total_productivity += productivity
-        total_lines += lines
-
-        cat = fs.get("category", "unknown")
-        if cat not in VALID_CATEGORIES:
-            cat = "chore"
-
-        file_scores.append({
-            "commit_sha": "",  # filled in by caller
-            "file_path": path,
-            "score": round(score, 4),
-            "category": cat,
-            "reasoning": (fs.get("reasoning") or "")[:1000],
-            "scored_at": "",  # filled in by caller
-        })
-
-    weighted_score = total_productivity / total_lines if total_lines > 0 else 0.0
-
-    return {
-        "files": file_scores,
-        "total_productivity": round(total_productivity, 4),
-        "weighted_score": round(weighted_score, 4),
-        "total_lines": total_lines,
-        "overall_category": score_result.get("overall_category", "unknown"),
-    }
+        sys.exit(1)
+    return anthropic.Anthropic(api_key=api_key)
 
 
 # ---------------------------------------------------------------------------
@@ -412,11 +59,13 @@ def _calculate_productivity(score_result: dict, diffs: list[dict]) -> dict | Non
 def _fetch_unscored_commits(
     storage: Storage,
     excluded_devs: list[str],
+    commit_table: str = "commit_scores",
 ) -> list[dict]:
-    """Return commits that have no entry in commit_scores yet."""
+    """Return commits that have no entry in the active commit score table."""
+    _schema.base_table(commit_table)  # whitelist check: raises on unknown names
     rows = storage.query(
         "SELECT c.* FROM commits c "
-        "LEFT JOIN commit_scores cs ON c.commit_sha = cs.commit_sha "
+        f"LEFT JOIN {commit_table} cs ON c.commit_sha = cs.commit_sha "
         "WHERE cs.commit_sha IS NULL "
         "ORDER BY c.committed_date DESC"
     )
@@ -435,8 +84,101 @@ def _fetch_unscored_commits(
 def _fetch_diffs_for_commit(storage: Storage, sha: str) -> list[dict]:
     """Retrieve diffs for a single commit."""
     return storage.query(
-        f"SELECT * FROM diffs WHERE commit_sha = '{sha}'"
+        "SELECT * FROM diffs WHERE commit_sha = $sha", {"sha": sha}
     )
+
+
+# ---------------------------------------------------------------------------
+# One series = one model
+# ---------------------------------------------------------------------------
+
+def _fail(message: str) -> None:
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _check_series(config: Config, storage: Storage,
+                  active: scoring_meta.ActiveScoring,
+                  settings: scoring.ScoringSettings,
+                  legacy_model: str | None = None,
+                  allow_prompt_change: bool = False) -> None:
+    """Refuse to append scores from a different instrument to the active series.
+
+    Instrument = model and ``prompt_version``. A model change always needs a
+    rebase; a prompt_version change (prompt, effort, post-processing logic)
+    needs ``--allow-prompt-change`` if the user really wants to continue the
+    series, in which case analysis will refuse ranges that span both versions.
+    """
+    configured = config.SCORING_MODEL
+    pv = settings.prompt_version
+    rebase = ("run /coding-productivity:calibrate and /coding-productivity:rebase "
+              "to move the whole series to the new instrument")
+
+    def check_prompt(existing: str | None, where: str) -> None:
+        if existing and existing != pv and not allow_prompt_change:
+            _fail(
+                f"prompt_version is {pv} but {where} was scored with {existing}: the "
+                "prompt, SCORING_EFFORT or the scoring logic changed. Mixing them "
+                f"inside one series breaks trends. To fix it, {rebase}. Or pass "
+                "--allow-prompt-change to continue anyway (analysis will then refuse "
+                "date ranges that span both versions)."
+            )
+
+    if active.from_meta:
+        if active.scorer_model != configured:
+            _fail(
+                f"SCORING_MODEL={configured} but the active scoring series "
+                f"(v{active.version}) was built with {active.scorer_model}. "
+                "Mixing models inside one series breaks trends. Either set "
+                f"SCORING_MODEL back to {active.scorer_model}, or {rebase}."
+            )
+        check_prompt(active.prompt_version, f"the active series (v{active.version})")
+        return
+
+    # Legacy series: the model is only known for rows that carry provenance.
+    rows = storage.query(
+        f"SELECT DISTINCT scorer_model, prompt_version FROM {active.commit_table} "
+        "WHERE scorer_model IS NOT NULL"
+    )
+    foreign = sorted({
+        r["scorer_model"] for r in rows
+        if not scoring_meta.model_matches(configured, r["scorer_model"])
+    })
+    if foreign:
+        _fail(
+            f"existing scores were produced by {', '.join(foreign)} but "
+            f"SCORING_MODEL={configured}. Mixing models inside one series breaks "
+            f"trends. Set SCORING_MODEL to the existing model, or {rebase}."
+        )
+    for r in rows:
+        check_prompt(r["prompt_version"], "existing rows")
+
+    null_rows = storage.query(
+        f"SELECT COUNT(*) AS n FROM {active.commit_table} WHERE scorer_model IS NULL"
+    )[0]["n"]
+    if null_rows:
+        # Scores from before provenance existed: the model is unknown, so
+        # appending labelled rows would silently splice two instruments.
+        if not legacy_model:
+            _fail(
+                f"{null_rows:,} existing score(s) have no recorded model (written before "
+                "provenance existed). Declare which model produced them with "
+                f"--legacy-model MODEL (it must equal SCORING_MODEL={configured}); that is "
+                "recorded as the series' model and the strict check applies from then on. "
+                f"If they came from another model, {rebase}."
+            )
+        if legacy_model != configured and not scoring_meta.model_matches(configured, legacy_model):
+            _fail(
+                f"--legacy-model {legacy_model} differs from SCORING_MODEL={configured}. "
+                f"Legacy scores from another model cannot be continued; {rebase}."
+            )
+        # Record this run's prompt_version too, so the prompt-change gate
+        # applies to this series from the next run on (the pre-existing rows
+        # themselves have no known prompt).
+        scoring_meta.record(storage, scoring_meta.LEGACY_VERSION, "active", configured, pv)
+        print(f"Recorded the legacy series (v1) as built with {configured}. Analysis over "
+              "ranges that mix these rows with newly scored ones needs --allow-legacy-null.",
+              flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -473,33 +215,43 @@ def score_commits(
     config: Config,
     workers: int = 10,
     batch_size: int = 50,
+    legacy_model: str | None = None,
+    allow_prompt_change: bool = False,
 ) -> list[dict]:
     """Score all unscored commits and persist results."""
 
     global _start_time
 
-    _ensure_consent()
-
-    # Load scoring prompt
-    system_prompt = _load_scoring_prompt()
+    scoring.ensure_consent()
 
     # Anthropic client
     api_key = config.ANTHROPIC_API_KEY
     if not api_key:
         print("Error: ANTHROPIC_API_KEY is not set in config.", file=sys.stderr)
         sys.exit(1)
-    claude = anthropic.Anthropic(api_key=api_key)
+    claude = _make_client(api_key)
 
-    # Discover model
-    _get_latest_haiku_model(claude)
+    settings = scoring.settings_or_exit(config)
+    prompt_version = settings.prompt_version
+    print(
+        f"Scoring model: {settings.model} (prompt_version {prompt_version})",
+        flush=True,
+    )
+    scoring.warn_if_newer_haiku(claude, settings.model)
 
     # Storage
     storage = get_storage(config)
     storage.create_tables()
 
+    active = scoring_meta.get_active(storage)
+    _check_series(config, storage, active, settings, legacy_model, allow_prompt_change)
+    active = scoring_meta.get_active(storage)  # a declared legacy model is recorded now
+    print(f"Writing to scoring series v{active.version} "
+          f"({active.commit_table} / {active.file_table}).", flush=True)
+
     # Commits to score
     excluded = config.EXCLUDED_DEVELOPERS
-    commits = _fetch_unscored_commits(storage, excluded)
+    commits = _fetch_unscored_commits(storage, excluded, active.commit_table)
 
     if not commits:
         print("All commits are already scored. Nothing to do.")
@@ -524,48 +276,29 @@ def score_commits(
     results: list[dict] = []
     batch_commit_rows: list[dict] = []
     batch_file_rows: list[dict] = []
+    failure_log = scoring.FailureLog()
     done = 0
     lock = threading.Lock()
     _start_time = time.time()
 
-    def _process(commit: dict) -> dict | None:
+    def _process(commit: dict):
         sha = commit["commit_sha"]
         diffs = commit_diffs.get(sha, [])
+        month = scoring.month_of(commit.get("authored_date"))
         if not diffs:
-            return None
+            return month, None, scoring.ScoreOutcome()
 
-        score_result = _score_commit_with_claude(claude, system_prompt, commit, diffs)
-        if not score_result:
-            return None
-
-        prod = _calculate_productivity(score_result, diffs)
-        if not prod:
-            return None
-
-        scored_at = datetime.now(timezone.utc).isoformat()
-
-        # Fill in commit_sha and scored_at for file rows.
-        for f in prod["files"]:
-            f["commit_sha"] = sha
-            f["scored_at"] = scored_at
-
-        return {
-            "commit_sha": sha,
-            "total_productivity": prod["total_productivity"],
-            "weighted_score": prod["weighted_score"],
-            "overall_category": prod["overall_category"],
-            "scored_at": scored_at,
-            "files": prod["files"],
-            "total_lines": prod["total_lines"],
-        }
+        rows, outcome = scoring.score_and_build_rows(claude, settings, commit, diffs)
+        return month, rows, outcome
 
     def _flush_batch() -> None:
         """Write accumulated rows to storage."""
-        nonlocal batch_commit_rows, batch_file_rows
-        if batch_commit_rows:
-            storage.insert_batch("commit_scores", batch_commit_rows)
+        # File rows first, commit row last: the commit row is the completion
+        # marker, so a crash in between leaves the commit unscored (retried).
         if batch_file_rows:
-            storage.insert_batch("file_scores", batch_file_rows)
+            storage.insert_batch(active.file_table, batch_file_rows)
+        if batch_commit_rows:
+            storage.insert_batch(active.commit_table, batch_commit_rows)
         batch_commit_rows.clear()
         batch_file_rows.clear()
 
@@ -574,21 +307,21 @@ def score_commits(
 
         try:
             for future in as_completed(futures):
-                result = future.result()
+                month, rows, outcome = future.result()
                 done += 1
 
                 with lock:
-                    if result:
-                        results.append(result)
-
-                        commit_row = {
-                            k: result[k]
-                            for k in ("commit_sha", "total_productivity",
-                                      "weighted_score", "overall_category",
-                                      "scored_at")
-                        }
-                        batch_commit_rows.append(commit_row)
-                        batch_file_rows.extend(result["files"])
+                    # Commits without diffs are skipped, not failures.
+                    if rows or outcome.failures or outcome.dropped_files:
+                        failure_log.record(month, rows is not None, outcome.failures,
+                                           outcome.dropped_files)
+                    if rows:
+                        results.append({
+                            **rows["commit_row"],
+                            "total_lines": rows["total_lines"],
+                        })
+                        batch_commit_rows.append(rows["commit_row"])
+                        batch_file_rows.extend(rows["file_rows"])
 
                         if len(batch_commit_rows) >= batch_size:
                             _flush_batch()
@@ -602,6 +335,7 @@ def score_commits(
             storage.close()
 
     print()  # newline after progress
+    print(failure_log.report())
     return results
 
 
@@ -642,7 +376,7 @@ def _print_summary(results: list[dict]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Score commits using Claude Haiku."
+        description="Score commits using Claude (model = SCORING_MODEL)."
     )
     parser.add_argument(
         "--config", "-c",
@@ -654,6 +388,17 @@ def main() -> None:
         type=int,
         default=10,
         help="Number of parallel API workers (default: 10).",
+    )
+    parser.add_argument(
+        "--legacy-model", default=None, metavar="MODEL",
+        help="Model that produced existing scores with no recorded model "
+             "(must equal SCORING_MODEL). Required once to continue such a series.",
+    )
+    parser.add_argument(
+        "--allow-prompt-change", action="store_true",
+        help="Continue the active series although prompt_version changed "
+             "(prompt, effort or scoring logic). Analysis will refuse ranges "
+             "that span both versions.",
     )
     parser.add_argument(
         "--batch-size",
@@ -678,7 +423,10 @@ def main() -> None:
         )
         sys.exit(1)
 
-    results = score_commits(config, workers=args.workers, batch_size=args.batch_size)
+    results = score_commits(
+        config, workers=args.workers, batch_size=args.batch_size,
+        legacy_model=args.legacy_model, allow_prompt_change=args.allow_prompt_change,
+    )
     _print_summary(results)
 
 

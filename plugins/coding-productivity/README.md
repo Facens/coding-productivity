@@ -6,7 +6,7 @@ Measure the impact of AI coding tools (Copilot, Cursor, Claude Code) on your tea
 
 | Type | Count |
 |------|-------|
-| Skills | 9 |
+| Skills | 11 |
 | Python modules | 11 |
 | MCP Servers | 0 |
 
@@ -34,7 +34,7 @@ In Claude Code:
 Or run each step individually:
 ```
 /coding-productivity:extract    # Pull new commits (incremental by default)
-/coding-productivity:score      # AI-score commits via Claude Haiku
+/coding-productivity:score      # AI-score commits with SCORING_MODEL (default: Claude Haiku 5.5)
 /coding-productivity:analyze    # View productivity trends and metrics
 /coding-productivity:report     # Generate executive summary markdown
 ```
@@ -43,7 +43,7 @@ Or run each step individually:
 
 - **Local-first** — DuckDB by default, zero cloud setup. BigQuery available as upgrade.
 - **GitHub + GitLab** — Supports both platforms, including self-hosted GitLab.
-- **AI scoring (optional)** — Claude Haiku evaluates each commit's intellectual value (0.0-1.0).
+- **AI scoring (optional)** — a Claude model you choose (`SCORING_MODEL`) evaluates each commit's intellectual value (0.0-1.0). Every score records the model and prompt that produced it.
 - **Identity management** — Bot detection, duplicate identity merging, developer exclusions.
 - **Anonymization** — HMAC-SHA256 hashing of developer identities, on by default.
 - **Incremental by default** — Re-runs fetch only new commits since the last extraction. Use `--full` to force a complete re-extraction.
@@ -57,7 +57,9 @@ Or run each step individually:
 | `setup` | Interactive configuration wizard |
 | `run` | Full pipeline: extract → score → analyze. Accepts date range (e.g., `run January 2026`) |
 | `extract` | Pull commits, diffs, PRs. Accepts date range or repo slug |
-| `score` | AI-powered commit scoring via Claude Haiku |
+| `score` | AI-powered commit scoring with `SCORING_MODEL` |
+| `calibrate` | Compare a candidate scoring model with the current one (COMPARABLE or REBASE REQUIRED) |
+| `rebase` | Rescore all commits with one model into a new versioned series (Batch API) and switch to it |
 | `analyze` | Interactive productivity analysis |
 | `report` | Generate executive summary in markdown |
 | `connect` | Connect to existing BigQuery dataset (read-only) |
@@ -74,6 +76,21 @@ All config lives in `.coding-productivity.env` (created by setup, gitignored aut
 |---------|-------------|-------|
 | DuckDB (default) | Individual developers, small teams | None — works out of the box |
 | BigQuery | Shared team access, large-scale analysis | Requires GCP project + service account |
+
+### Scoring model changes
+
+The scoring model is a measuring instrument: **one series = one model**. A newer model can change the scale of the scores, and the shift differs by period, so a series that mixes two models shows a trend in the instrument rather than in productivity. No single conversion factor repairs that. The plugin therefore never switches models for you:
+
+- `SCORING_MODEL` is explicit (setup writes `claude-haiku-5-5`). A newer Haiku only produces a WARNING.
+- Every score row records `scorer_model` (what the API returned) and `prompt_version` (a hash of prompt, model, thinking config, effort and the scoring post-processing rules).
+- `analyze` refuses date ranges that contain more than one recorded model or `prompt_version`, and refuses recorded-plus-unrecorded (legacy) scores unless you pass `--allow-legacy-null`. `score` refuses to append scores from another model, or from another `prompt_version` unless you pass `--allow-prompt-change`. To continue a series whose scores carry no recorded model, declare it once with `score --legacy-model <model>` (it must equal `SCORING_MODEL`).
+
+To change models:
+
+1. `/coding-productivity:calibrate --candidate <model>` rescores a stratified sample with the current and the candidate model, no writes to the score tables. It compares the candidate with the current model's own test-retest noise and says **COMPARABLE** or **REBASE REQUIRED**, with the token use and the estimated cost of a full rebase.
+2. Set `SCORING_MODEL` to the candidate, then `/coding-productivity:rebase`. It rescores all commits through the Message Batches API (50% of standard prices) into new tables `commit_scores_v{N}` / `file_scores_v{N}`, retries failures synchronously, reports per-month counts, and only then switches the active series (recorded in the `scoring_meta` table). The old tables are untouched.
+
+Batches can take up to 24 hours; `rebase` is resumable and reports `still processing` until they finish.
 
 ### Anonymization
 

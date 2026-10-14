@@ -8,10 +8,34 @@ selected at runtime via the ``STORAGE_BACKEND`` configuration key.
 from __future__ import annotations
 
 import abc
+import re
+import time
 from pathlib import Path
 from typing import Any, Optional
 
 from . import schema as _schema
+
+_NOT_FOUND_NAMES = {"CatalogException", "NotFound"}
+
+
+def is_table_missing(exc: BaseException) -> bool:
+    """True only for "table (or dataset) does not exist" errors.
+
+    DuckDB raises ``CatalogException``; BigQuery raises
+    ``google.api_core.exceptions.NotFound``. Matched by class name so neither
+    library has to be importable. Any other failure (network, quota,
+    permissions) must propagate: treating it as "no such table" would make
+    callers fall back to the wrong data.
+    """
+    return any(c.__name__ in _NOT_FOUND_NAMES for c in type(exc).__mro__)
+
+
+# Seconds slept between retries of a streaming insert that BigQuery rejects
+# because a table or column created moments ago is not visible yet.
+_STREAM_RETRY_DELAYS = (2, 4, 8, 16, 32, 64, 120)  # ~4 minutes in total
+_sleep = time.sleep
+
+_NAMED_PARAM = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
 # ── Abstract base ────────────────────────────────────────────────────────────
@@ -33,6 +57,14 @@ class Storage(abc.ABC):
 
     @abc.abstractmethod
     def count(self, table: str) -> int: ...
+
+    @abc.abstractmethod
+    def list_tables(self) -> set[str]:
+        """Names of all tables that currently exist in the store."""
+
+    @abc.abstractmethod
+    def ensure_table(self, table: str) -> None:
+        """Create *table* (a known or versioned score table) if missing."""
 
     @abc.abstractmethod
     def close(self) -> None: ...
@@ -79,6 +111,46 @@ class DuckDBStorage(Storage):
             for table_name in _schema.SCHEMAS:
                 ddl = _schema.get_create_sql(table_name)
                 self._conn.execute(ddl)
+            self._migrate_columns(
+                list(_schema.SCHEMAS)
+                + sorted(_schema.versioned_score_tables(self.list_tables()))
+            )
+
+    def _existing_columns(self, table: str) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'main' AND table_name = ?",
+            [table],
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def _migrate_columns(self, tables: list[str]) -> None:
+        """Add columns that the current schema defines but the table lacks.
+
+        Lets installs created by an older plugin version keep working: old
+        rows get NULL in the new columns.
+        """
+        for table in tables:
+            have = self._existing_columns(table)
+            for col, dtype in _schema.get_column_types(table).items():
+                if col not in have:
+                    # Identifiers come from the schema whitelist, not user input.
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {dtype}"
+                    )
+
+    def list_tables(self) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'main'"
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def ensure_table(self, table: str) -> None:
+        self._assert_writable()
+        ddl = _schema.get_create_sql(table)  # validates the table name
+        with self._lock:
+            self._conn.execute(ddl)
 
     def insert_batch(self, table: str, records: list[dict[str, Any]]) -> None:
         self._assert_writable()
@@ -178,24 +250,62 @@ class BigQueryStorage(Storage):
         self._assert_writable()
         from google.cloud import bigquery as bq
 
-        # Map DuckDB types to BigQuery types
-        type_map = {
-            "VARCHAR": "STRING",
-            "TEXT": "STRING",
-            "INTEGER": "INTEGER",
-            "DOUBLE": "FLOAT64",
-            "TIMESTAMP": "TIMESTAMP",
-            "BOOLEAN": "BOOLEAN",
-        }
-
         for table_name, columns in _schema.SCHEMAS.items():
             ref = self._table_ref(table_name)
             bq_schema = [
-                bq.SchemaField(col, type_map.get(dtype, "STRING"))
+                bq.SchemaField(col, self._TYPE_MAP.get(dtype, "STRING"))
                 for col, dtype in columns.items()
             ]
             table = bq.Table(ref, schema=bq_schema)
             self._client.create_table(table, exists_ok=True)
+
+        self._migrate_columns(
+            list(_schema.SCHEMAS)
+            + sorted(_schema.versioned_score_tables(self.list_tables()))
+        )
+
+    _TYPE_MAP = {
+        "VARCHAR": "STRING",
+        "TEXT": "STRING",
+        "INTEGER": "INTEGER",
+        "DOUBLE": "FLOAT64",
+        "TIMESTAMP": "TIMESTAMP",
+        "BOOLEAN": "BOOLEAN",
+    }
+
+    def _migrate_columns(self, tables: list[str]) -> None:
+        """Append schema columns missing from existing tables (nullable)."""
+        from google.cloud import bigquery as bq
+
+        for table_name in tables:
+            table = self._client.get_table(self._table_ref(table_name))
+            have = {f.name for f in table.schema}
+            missing = [
+                bq.SchemaField(col, self._TYPE_MAP.get(dtype, "STRING"), mode="NULLABLE")
+                for col, dtype in _schema.get_column_types(table_name).items()
+                if col not in have
+            ]
+            if missing:
+                table.schema = list(table.schema) + missing
+                self._client.update_table(table, ["schema"])
+
+    def list_tables(self) -> set[str]:
+        return {
+            t.table_id
+            for t in self._client.list_tables(f"{self._project}.{self._dataset}")
+        }
+
+    def ensure_table(self, table: str) -> None:
+        self._assert_writable()
+        from google.cloud import bigquery as bq
+
+        bq_schema = [
+            bq.SchemaField(col, self._TYPE_MAP.get(dtype, "STRING"))
+            for col, dtype in _schema.get_column_types(table).items()
+        ]
+        self._client.create_table(
+            bq.Table(self._table_ref(table), schema=bq_schema), exists_ok=True
+        )
 
     def insert_batch(self, table: str, records: list[dict[str, Any]]) -> None:
         self._assert_writable()
@@ -213,25 +323,68 @@ class BigQueryStorage(Storage):
 
         # Stream in chunks.
         for i in range(0, len(clean), self._CHUNK_SIZE):
-            chunk = clean[i : i + self._CHUNK_SIZE]
-            errors = self._client.insert_rows_json(ref, chunk)
-            if errors:
+            self._stream_chunk(table, ref, clean[i : i + self._CHUNK_SIZE])
+
+    def _stream_chunk(self, table: str, ref: str, chunk: list[dict]) -> None:
+        """Stream one chunk, retrying while a fresh table or column is not
+        yet visible to the streaming API ("no such field" / 404 right after
+        ``create_table`` or ``update_table``)."""
+        for attempt in range(len(_STREAM_RETRY_DELAYS) + 1):
+            try:
+                errors = self._client.insert_rows_json(ref, chunk)
+            except Exception as exc:  # noqa: BLE001
+                if not is_table_missing(exc):
+                    raise
+                errors, retryable = [str(exc)], True
+            else:
+                retryable = bool(errors) and "no such field" in str(errors).lower()
+            if not errors and not retryable:
+                return
+            if not retryable or attempt == len(_STREAM_RETRY_DELAYS):
                 raise RuntimeError(
                     f"BigQuery streaming insert errors for {table}: {errors}"
                 )
+            _sleep(_STREAM_RETRY_DELAYS[attempt])
 
     def query(self, sql: str, params: Optional[dict] = None) -> list[dict[str, Any]]:
         from google.cloud import bigquery as bq
 
-        job_config = None
+        # Default dataset lets unqualified table names (as used by the
+        # analysis and scoring SQL) resolve against the configured dataset.
+        job_config = bq.QueryJobConfig(
+            default_dataset=f"{self._project}.{self._dataset}"
+        )
         if params:
-            query_params = [
-                bq.ScalarQueryParameter(k, "STRING", v) for k, v in params.items()
+            # The SQL in this plugin uses DuckDB's ``$name`` placeholders;
+            # BigQuery wants ``@name`` and rejects ``$``.
+            sql = _NAMED_PARAM.sub(
+                lambda m: f"@{m.group(1)}" if m.group(1) in params else m.group(0), sql
+            )
+            job_config.query_parameters = [
+                self._query_param(bq, k, v) for k, v in params.items()
             ]
-            job_config = bq.QueryJobConfig(query_parameters=query_params)
 
         result = self._client.query(sql, job_config=job_config).result()
         return [dict(row) for row in result]
+
+    @staticmethod
+    def _query_param(bq, name: str, value: Any):
+        """Typed query parameter. Strings stay STRING (dates included)."""
+        def kind(v: Any) -> str:
+            if isinstance(v, bool):
+                return "BOOL"
+            if isinstance(v, int):
+                return "INT64"
+            if isinstance(v, float):
+                return "FLOAT64"
+            return "STRING"
+
+        if isinstance(value, (list, tuple, set)):
+            values = list(value)
+            return bq.ArrayQueryParameter(
+                name, kind(values[0]) if values else "STRING", values
+            )
+        return bq.ScalarQueryParameter(name, kind(value), value)
 
     def get_existing_shas(self, table: str) -> set[str]:
         ref = self._table_ref(table)

@@ -452,7 +452,7 @@ def _extract_pr_commit_links(
 
     # Get PR IIDs that are in storage but have no links yet.
     # merge_requests stores short project_name (e.g., "admin"),
-    # while repo is full path (e.g., "team-blue-Hub/admin").
+    # while repo is full path (e.g., "org/admin").
     repo_short = repo.split("/")[-1] if "/" in repo else repo
 
     try:

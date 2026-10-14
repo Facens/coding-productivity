@@ -22,11 +22,12 @@ python3.14 -c "
 import sys; sys.path.insert(0, 'scripts')
 from lib.config import Config
 from lib.storage import get_storage
+from lib.scoring_meta import get_active
 cfg = Config()
 st = get_storage(cfg)
 commits = st.count('commits')
 try:
-    scores = st.count('commit_scores')
+    scores = st.count(get_active(st).commit_table)
 except:
     scores = 0
 try:
@@ -113,6 +114,10 @@ python3.14 scripts/analyze.py --config .coding-productivity.env \
     --baseline-start <b_start> --baseline-end <b_end> \
     --comparison-start <c_start> --comparison-end <c_end> --format json
 ```
+
+If a score-based query exits with an error that the date range mixes scoring models, stop and tell the user: a report across two models would present a change of instrument as a change in productivity. Offer to narrow the range to one model, or to run `/coding-productivity:calibrate` and `/coding-productivity:rebase`. Pass `--allow-legacy-null` only if the user confirms that scores with no recorded model come from the same model as the rest.
+
+When scoring data is included, state in the report which `scorer_model` produced the scores (shown by the `score` skill summary or the `scoring_meta` table) so readers know the instrument.
 
 ## Step 5: Compose the Report
 

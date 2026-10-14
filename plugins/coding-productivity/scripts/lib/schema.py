@@ -7,6 +7,7 @@ Helper functions generate DDL and column lists from these definitions.
 
 from __future__ import annotations
 
+import re
 from collections import OrderedDict
 
 # ── Schema definitions ───────────────────────────────────────────────────────
@@ -90,6 +91,12 @@ SCHEMAS: dict[str, OrderedDict[str, str]] = {
             ("weighted_score", "DOUBLE"),
             ("overall_category", "VARCHAR"),
             ("scored_at", "TIMESTAMP"),
+            # Provenance: which instrument produced this row.
+            ("scorer_model", "VARCHAR"),
+            ("prompt_version", "VARCHAR"),
+            # Per-file diff cap actually sent (10000, 2000 or 1000): retries
+            # send less under the same prompt_version. NULL for older rows.
+            ("diff_chars", "INTEGER"),
         ]
     ),
     "file_scores": OrderedDict(
@@ -100,18 +107,61 @@ SCHEMAS: dict[str, OrderedDict[str, str]] = {
             ("category", "VARCHAR"),
             ("reasoning", "TEXT"),
             ("scored_at", "TIMESTAMP"),
+            ("scorer_model", "VARCHAR"),
+            ("prompt_version", "VARCHAR"),
+        ]
+    ),
+    # Append-only log of scoring series (see lib/scoring_meta.py). The active
+    # series is the most recent row with status = 'active'.
+    "scoring_meta": OrderedDict(
+        [
+            ("version", "INTEGER"),
+            ("status", "VARCHAR"),  # 'building' | 'active'
+            ("commit_table", "VARCHAR"),
+            ("file_table", "VARCHAR"),
+            ("scorer_model", "VARCHAR"),  # the configured SCORING_MODEL
+            ("prompt_version", "VARCHAR"),
+            ("recorded_at", "TIMESTAMP"),
         ]
     ),
 }
 
+# Versioned score tables (``commit_scores_v2``, ``file_scores_v2``, ...) share
+# the schema of their unversioned base table.
+_VERSIONED_RE = re.compile(r"^(commit_scores|file_scores)_v([0-9]+)$")
+
 
 # ── Public helpers ───────────────────────────────────────────────────────────
 
+def base_table(table_name: str) -> str:
+    """
+    Resolve *table_name* to the key of its schema in ``SCHEMAS``.
+
+    Versioned score tables map to their base table. Anything else must be a
+    known table, so this doubles as the whitelist that makes it safe to
+    interpolate a table name into SQL (identifiers cannot be bound parameters).
+    """
+    if table_name in SCHEMAS:
+        return table_name
+    m = _VERSIONED_RE.match(table_name)
+    if m:
+        return m.group(1)
+    raise ValueError(f"Unknown table: {table_name}")
+
+
+def versioned_score_tables(names) -> set[str]:
+    """Filter *names* down to versioned score tables (``commit_scores_v2``...)."""
+    return {n for n in names if _VERSIONED_RE.match(n)}
+
+
 def get_columns(table_name: str) -> list[str]:
     """Return the ordered list of column names for *table_name*."""
-    if table_name not in SCHEMAS:
-        raise ValueError(f"Unknown table: {table_name}")
-    return list(SCHEMAS[table_name].keys())
+    return list(SCHEMAS[base_table(table_name)].keys())
+
+
+def get_column_types(table_name: str) -> "OrderedDict[str, str]":
+    """Return the ``column -> DuckDB type`` mapping for *table_name*."""
+    return SCHEMAS[base_table(table_name)]
 
 
 def get_create_sql(table_name: str) -> str:
@@ -120,9 +170,6 @@ def get_create_sql(table_name: str) -> str:
 
     Uses DuckDB-compatible types.
     """
-    if table_name not in SCHEMAS:
-        raise ValueError(f"Unknown table: {table_name}")
-
-    columns = SCHEMAS[table_name]
+    columns = get_column_types(table_name)
     col_defs = ",\n    ".join(f"{col} {dtype}" for col, dtype in columns.items())
     return f"CREATE TABLE IF NOT EXISTS {table_name} (\n    {col_defs}\n);"

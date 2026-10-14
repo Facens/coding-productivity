@@ -26,7 +26,7 @@ In Claude Code:
 Or run each step individually:
 ```
 /coding-productivity:extract    # Pull new commits (incremental by default)
-/coding-productivity:score      # AI-score commits via Claude Haiku
+/coding-productivity:score      # AI-score commits with SCORING_MODEL (Claude Haiku 5.5 by default)
 /coding-productivity:analyze    # View productivity trends and metrics
 /coding-productivity:report     # Generate executive summary markdown
 ```
