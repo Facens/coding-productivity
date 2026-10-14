@@ -61,7 +61,7 @@ def parse_parents(parent_ids: Optional[str]) -> list[str]:
     return [p.strip() for p in (parent_ids or "").split(",") if p.strip()]
 
 
-def _utc_naive(value) -> datetime:
+def utc_naive(value) -> datetime:
     """Comparable timestamp: DuckDB returns naive, BigQuery tz-aware datetimes."""
     if value is None:
         return datetime.max
@@ -220,7 +220,7 @@ def _load_commits(storage) -> dict[str, _Commit]:
             lines=(r["additions"] or 0) + (r["deletions"] or 0),
             parents=parse_parents(r["parent_ids"]),
         )
-        when[sha] = _utc_naive(r["committed_date"] or r["authored_date"])
+        when[sha] = utc_naive(r["committed_date"] or r["authored_date"])
     # Rank = position in (committed_date, sha) order: "earliest" everywhere.
     for rank, sha in enumerate(sorted(commits, key=lambda s: (when[s], s))):
         commits[sha].rank = rank
@@ -260,7 +260,7 @@ def _load_merge_requests(storage) -> tuple[dict, dict]:
         "SELECT mr_iid, project_id, project_name, web_url, state, source_branch, "
         "merge_commit_sha, squash_commit_sha, extracted_at FROM merge_requests"
     ))
-    rows.sort(key=lambda r: _utc_naive(r["extracted_at"]), reverse=True)  # newest first
+    rows.sort(key=lambda r: utc_naive(r["extracted_at"]), reverse=True)  # newest first
     mrs: dict[tuple[str, str], _MR] = {}
     for r in rows:
         key = (_mr_project(r["project_id"], r["web_url"], r["project_name"]), str(r["mr_iid"]))

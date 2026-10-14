@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 
 from lib import duplicate_work as dw
 from lib import scoring_meta
+from lib.merge_requests import LATEST_MRS
 from lib.config import Config
 from lib.storage import get_storage, is_table_missing, Storage
 
@@ -635,7 +636,7 @@ def merge_velocity(storage: Storage, config: Config,
               AND m.merged_at IS NOT NULL
               AND EXTRACT(EPOCH FROM (m.merged_at - m.created_at)) / 86400.0 <= 30
         ) AS merged_within_30d
-    FROM merge_requests m
+    FROM {LATEST_MRS} m
     {where_sql}
     GROUP BY date_trunc('month', m.created_at)
     ORDER BY month
@@ -705,7 +706,7 @@ def code_efficiency(storage: Storage, config: Config,
     WITH commit_merged AS (
         SELECT DISTINCT mc.commit_sha
         FROM mr_commits mc
-        JOIN merge_requests mr
+        JOIN {LATEST_MRS} mr
             ON mc.mr_iid = mr.mr_iid AND mc.project_id LIKE '%' || mr.project_name
         WHERE mr.state = 'merged'
     )

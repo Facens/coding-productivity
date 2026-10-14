@@ -19,10 +19,16 @@ Duplicate-work detection. On real data (a GitLab org and a GitHub org, all branc
 - Merge requests are matched to their commits by `(project, iid)` where project is the GitLab project id or the GitHub `owner/name` from `web_url`, never the short name alone (iids restart in every project). A `merge_commit_sha` that is one of the MR's own commits (a fast-forward head) is not treated as a duplicate.
 - Implemented in Python on top of `Storage`, not per-backend SQL, so DuckDB and BigQuery behave the same and the rules are testable offline. `diffs` is streamed twice (fingerprints are 64-bit ints) and never loaded whole.
 
+### Fixed
+
+- GitHub extractor: the PR dedup query and the `mr_id` lookup filtered `merge_requests` on `project_path`, a column that does not exist, and the error was swallowed. PRs were never deduplicated and `mr_commits.mr_id` was always empty. Both now use the real columns (`mr_id` comes from the PR row itself), and query errors are no longer swallowed.
+- Re-extraction no longer double-inserts merge requests on either platform (GitLab never deduplicated at all). An MR is stored again only when it is new, changed (`updated_at` or `state`) or has gained a merge/squash sha its stored row lacks; GitLab MR-commit links already stored are not added again. Rows are still never updated: a changed MR is a newer version. Every reader takes the version with the latest `extracted_at` per `mr_id` (`lib/merge_requests.py`): `merge_velocity` and `code_efficiency` in `analyze.py` (the latter joined `merge_requests` to commits, so duplicate MR rows multiplied its additions), and `dedupe`, so stores that were already duplicated read correctly.
+- GitLab extraction with `--full` and no `--since`/`--until` compared a string with None (`since` and `until` are now optional bounds, and so is `until` on an incremental run, which failed the same way).
+
 ### Upgrade notes
 
 - Run `/coding-productivity:dedupe` (or `scripts/dedupe.py`) once, then after every extraction. Until then `analyze` warns and numbers are unchanged.
-- Merge requests extracted before 0.14 have NULL shas, so the squash and promotion rules find nothing for them until the period is extracted again (`extract --since ... --until ...`, plus `--full` on GitHub). The merge, copy and moved-code rules work on existing data. Re-extraction inserts a second row per merge request (the extractors do not update rows); `dedupe` reads the newest, but `merge_velocity` counts both.
+- Merge requests extracted before 0.14 have NULL shas, so the squash and promotion rules find nothing for them until the period is extracted again (`extract --since ... --until ...`, plus `--full` on GitHub). Re-extraction now stores such an MR once more, with its sha, and nothing else; the merge, copy and moved-code rules work on existing data.
 - Trends computed before and after the first dedupe run are not comparable; recompute any figure you published.
 
 ## 0.13.0

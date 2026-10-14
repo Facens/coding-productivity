@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.config import Config
 from lib.storage import get_storage
 from lib.gitlab_client import GitLabClient
-from lib import bots, checkpoint, anonymize
+from lib import bots, checkpoint, anonymize, merge_requests
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -97,8 +97,8 @@ def _extract_commits(
     storage,
     project: dict,
     *,
-    since: str,
-    until: str,
+    since: str | None,
+    until: str | None,
     batch_size: int,
     existing_shas: set[str],
     anon_key: bytes | None,
@@ -120,7 +120,7 @@ def _extract_commits(
     for branch in all_branches:
         commit_info = branch.get("commit", {})
         committed_date = (commit_info.get("committed_date") or "")[:10]
-        if committed_date and committed_date < since:
+        if since and committed_date and committed_date < since:
             continue
         active_branches.append(branch["name"])
 
@@ -278,8 +278,8 @@ def _extract_merge_requests(
     storage,
     project: dict,
     *,
-    since: str,
-    until: str,
+    since: str | None,
+    until: str | None,
     batch_size: int,
     anon_key: bytes | None,
     merges: dict | None,
@@ -298,13 +298,28 @@ def _extract_merge_requests(
     total_mrs = 0
     total_mr_commits = 0
     skipped_bots = 0
+    skipped_current = 0
+
+    # Latest stored version of each MR (by MR id), and the links already stored:
+    # an MR is stored again only when it changed or gained its sha, and only
+    # links not yet stored are added, so re-running extraction adds nothing.
+    stored = merge_requests.stored_mrs(
+        storage, "m.project_id = $pid", {"pid": str(project_id)}
+    )
+    linked = {
+        (str(r["mr_iid"]), r["commit_sha"])
+        for r in storage.query(
+            "SELECT mr_iid, commit_sha FROM mr_commits WHERE project_id = $pid",
+            {"pid": str(project_id)},
+        )
+    }
 
     for mr in client.get_merge_requests(project_id, state="all"):
         # Date-range filtering on updated_at
         updated_at = mr.get("updated_at", "")
         if updated_at:
             update_date = updated_at[:10]
-            if update_date < since or update_date > until:
+            if (since and update_date < since) or (until and update_date > until):
                 continue
 
         # Bot filtering on author
@@ -345,6 +360,10 @@ def _extract_merge_requests(
             "extracted_at": extracted_at,
         }
 
+        if not merge_requests.needs_refresh(stored.get(mr_record["mr_id"]), mr_record):
+            skipped_current += 1
+            continue
+
         # Anonymization
         orig_name = mr_record["author_name"] or ""
         orig_email = mr_record["author_email"] or ""
@@ -360,10 +379,14 @@ def _extract_merge_requests(
         # Fetch commits for this MR
         mr_commits = client.get_mr_commits(project_id, mr["iid"])
         for c in mr_commits:
+            sha = c.get("id") or c.get("sha", "")
+            if (str(mr["iid"]), sha) in linked:
+                continue
+            linked.add((str(mr["iid"]), sha))
             link = {
                 "mr_id": str(mr["id"]),
                 "mr_iid": str(mr["iid"]),
-                "commit_sha": c.get("id") or c.get("sha", ""),
+                "commit_sha": sha,
                 "project_id": str(project_id),
                 "extracted_at": extracted_at,
             }
@@ -390,6 +413,8 @@ def _extract_merge_requests(
         total_mr_commits += len(mr_commits_batch)
 
     skip_msg = f" (skipped {skipped_bots} bots/excluded)" if skipped_bots else ""
+    if skipped_current:
+        skip_msg += f" ({skipped_current} unchanged, already stored)"
     print(
         f"  MRs: {total_mrs} stored, MR-commits: {total_mr_commits} stored{skip_msg}",
         flush=True,
@@ -403,8 +428,8 @@ def run(
     config: Config,
     *,
     single_project: str | None = None,
-    since: str,
-    until: str,
+    since: str | None,
+    until: str | None,
     batch_size: int = 500,
 ):
     """Execute the full GitLab extraction pipeline."""
@@ -429,8 +454,8 @@ def run(
     print("GitLab Extraction", flush=True)
     print("=" * 60, flush=True)
     print(f"  Instance : {base_url}", flush=True)
-    print(f"  Since    : {since}", flush=True)
-    print(f"  Until    : {until}", flush=True)
+    print(f"  Since    : {since or '(all)'}", flush=True)
+    print(f"  Until    : {until or '(all)'}", flush=True)
     print(f"  Batch    : {batch_size}", flush=True)
 
     # ── Bot overrides ────────────────────────────────────────────────────

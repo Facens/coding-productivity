@@ -37,7 +37,7 @@ from lib.storage import get_storage, Storage
 from lib.github_client import GitHubClient
 from lib import checkpoint
 from lib import anonymize
-from lib import bots
+from lib import bots, merge_requests
 
 # ---------------------------------------------------------------------------
 # Identity columns that must be pseudonymized when anonymization is enabled.
@@ -344,17 +344,13 @@ def _extract_pull_requests(
 
     slug = repo.replace("/", "_")
 
-    # Existing PR IDs for dedup.
-    try:
-        rows = storage.query(
-            f"SELECT DISTINCT mr_iid FROM merge_requests "
-            f"WHERE project_path = '{repo}'"
-        )
-        existing_iids = {str(r["mr_iid"]) for r in rows}
-    except Exception:
-        existing_iids = set()
+    # Latest stored version of every PR of this repo, by PR id. A PR is stored
+    # again only when it changed (or gained its merge sha): see needs_refresh.
+    stored = merge_requests.stored_mrs(
+        storage, "m.project_name = $repo_name", {"repo_name": repo.split("/")[-1]}
+    )
 
-    print(f"[{repo}] {len(existing_iids):,} existing PRs in storage", flush=True)
+    print(f"[{repo}] {len(stored):,} existing PRs in storage", flush=True)
     print(f"[{repo}] Fetching pull requests...", flush=True)
 
     batch: list[dict] = []
@@ -367,10 +363,6 @@ def _extract_pull_requests(
             # Date filter: skip PRs updated before our window.
             updated_at = pr.get("updated_at", "")
             if since and updated_at and updated_at[:10] < since:
-                continue
-
-            # Dedup.
-            if str(pr_number) in existing_iids:
                 continue
 
             merged_at = pr.get("merged_at")
@@ -411,6 +403,9 @@ def _extract_pull_requests(
                 "web_url": pr.get("html_url", ""),
                 "extracted_at": _now_iso(),
             }
+
+            if not merge_requests.needs_refresh(stored.get(mr_record["mr_id"]), mr_record):
+                continue
 
             if anon_key:
                 anonymize.hash_record(
@@ -458,24 +453,18 @@ def _extract_pr_commit_links(
     # while repo is full path (e.g., "org/admin").
     repo_short = repo.split("/")[-1] if "/" in repo else repo
 
-    try:
-        pr_rows = storage.query(
-            "SELECT DISTINCT mr_iid FROM merge_requests "
-            "WHERE project_name = $repo_name",
-            {"repo_name": repo_short},
-        )
-    except Exception:
-        pr_rows = []
+    # Latest version of each PR (one row per PR, whatever re-extraction left).
+    pr_rows = storage.query(
+        f"SELECT m.mr_iid AS mr_iid, m.mr_id AS mr_id FROM {merge_requests.LATEST_MRS} m "
+        "WHERE m.project_name = $repo_name",
+        {"repo_name": repo_short},
+    )
 
-    try:
-        linked_rows = storage.query(
-            "SELECT DISTINCT mr_iid FROM mr_commits "
-            "WHERE project_id = $repo_slug",
-            {"repo_slug": repo},
-        )
-        linked_iids = {str(r["mr_iid"]) for r in linked_rows}
-    except Exception:
-        linked_iids = set()
+    linked_rows = storage.query(
+        "SELECT DISTINCT mr_iid FROM mr_commits WHERE project_id = $repo_slug",
+        {"repo_slug": repo},
+    )
+    linked_iids = {str(r["mr_iid"]) for r in linked_rows}
 
     need_links = [r for r in pr_rows if str(r["mr_iid"]) not in linked_iids]
     if not need_links:
@@ -496,15 +485,7 @@ def _extract_pr_commit_links(
             print(f"[{repo}] Error fetching commits for PR #{iid}: {exc}", flush=True)
             continue
 
-        # Find the mr_id for this iid.
-        try:
-            id_rows = storage.query(
-                f"SELECT mr_id FROM merge_requests "
-                f"WHERE mr_iid = '{iid}' AND project_path = '{repo}' LIMIT 1"
-            )
-            mr_id = id_rows[0]["mr_id"] if id_rows else ""
-        except Exception:
-            mr_id = ""
+        mr_id = row["mr_id"] or ""
 
         for pc in pr_commits:
             link_record: dict = {
