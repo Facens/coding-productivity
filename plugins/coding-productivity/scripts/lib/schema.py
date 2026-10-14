@@ -69,6 +69,12 @@ SCHEMAS: dict[str, OrderedDict[str, str]] = {
             ("closed_at", "TIMESTAMP"),
             ("source_branch", "VARCHAR"),
             ("target_branch", "VARCHAR"),
+            # The commit a merged MR/PR left on its target branch. GitHub:
+            # merge_commit_sha (the merge commit, or the squash/rebase result).
+            # GitLab: merge_commit_sha plus squash_commit_sha. Only set for
+            # merged MRs; NULL on rows extracted before 0.14.
+            ("merge_commit_sha", "VARCHAR"),
+            ("squash_commit_sha", "VARCHAR"),
             ("additions", "INTEGER"),
             ("deletions", "INTEGER"),
             ("web_url", "VARCHAR"),
@@ -122,6 +128,37 @@ SCHEMAS: dict[str, OrderedDict[str, str]] = {
             ("scorer_model", "VARCHAR"),  # the configured SCORING_MODEL
             ("prompt_version", "VARCHAR"),
             ("recorded_at", "TIMESTAMP"),
+        ]
+    ),
+    # ── Duplicate-work detection (scripts/dedupe.py). All three tables are
+    # rebuilt wholesale on every run; see lib/duplicate_work.py.
+    "duplicate_commits": OrderedDict(
+        [
+            ("commit_sha", "VARCHAR"),
+            ("why", "VARCHAR"),  # merge | squash | promotion | copy
+            ("rules_version", "INTEGER"),
+        ]
+    ),
+    # One row per (commit, file) whose moved_lines > 0; no row = nothing moved.
+    "file_moved_share": OrderedDict(
+        [
+            ("commit_sha", "VARCHAR"),
+            ("file_path", "VARCHAR"),
+            ("qualifying_lines", "INTEGER"),
+            ("moved_lines", "INTEGER"),
+            ("moved_share", "DOUBLE"),
+            ("rules_version", "INTEGER"),
+        ]
+    ),
+    # Completion marker of the last dedupe run (the other two tables can be
+    # legitimately empty, so emptiness cannot mean "never ran"). Written last.
+    "dedupe_runs": OrderedDict(
+        [
+            ("rules_version", "INTEGER"),
+            ("run_at", "TIMESTAMP"),
+            ("commits", "INTEGER"),  # commits table size at run time
+            ("merged_mrs", "INTEGER"),
+            ("merged_mrs_with_sha", "INTEGER"),
         ]
     ),
 }

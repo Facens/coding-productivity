@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.14.0
+
+Duplicate-work detection. On real data (a GitLab org and a GitHub org, all branches) the same work was counted several times and the duplicate share grew over time, inflating trends: a board-level "+70%" became "+60%" once duplicates were removed. Five rules, validated by hand on that data, now find them.
+
+### Added
+
+- `dedupe` skill and `scripts/dedupe.py`, added to the `run` pipeline after scoring. Rules: **merge** (two or more parents, second parent in the table, whatever the title), **squash** (single-parent squash/merge commit of a merged MR/PR whose branch commits cover at least 80% of its lines), **promotion** (merge/squash commit of an MR/PR from a long-lived source branch such as staging or develop), **copy** (same project, author, title and per-file changed-line content as an earlier commit; a title plus line-count signature gave 477 false positives, so content is used) and **moved code** (added lines of at least 25 characters that first appeared in a different file; lines found in 20 or more files are boilerplate). The first four exclude commits, the fifth discounts files.
+- Tables `duplicate_commits(commit_sha, why, rules_version)`, `file_moved_share(commit_sha, file_path, qualifying_lines, moved_lines, moved_share, rules_version)` (rows for files with moved lines only) and `dedupe_runs` (completion marker of the last run). All three are rebuilt wholesale on every run; `rules_version` is `DEDUPE_RULES_VERSION` in `scripts/lib/duplicate_work.py`, where all thresholds live.
+- `merge_requests.merge_commit_sha` and `squash_commit_sha` (nullable), filled by `extract_github.py` (`merge_commit_sha`) and `extract_gitlab.py` (`merge_commit_sha`, `squash_commit_sha`) for merged MRs only. `create_tables` adds them to existing DuckDB and BigQuery tables.
+- `Storage.iter_query` (rows streamed page by page) and `Storage.replace_table` (replace a table's contents: one transaction on DuckDB, a `WRITE_TRUNCATE` load job on BigQuery).
+- `analyze.py --require-dedupe`.
+
+### Changed
+
+- `analyze.py` excludes `duplicate_commits` from every commit-based query and, in every productivity metric, recomputes commit productivity from the active series' file scores times `1 - moved_share` (for files with `moved_share >= 0.5`), after deduplicating file rows per `(commit_sha, file_path)`. A commit with no file rows keeps its stored total. Unscored lines-changed metrics get the same exclusion and discount; `code_efficiency` gets the exclusion only. `merge_velocity` is unchanged.
+- `analyze.py` prints `excluded: N commits (merge a / squash b / promotion c / copy d), moved-code discount X% of productivity` for the selected range (stdout for tables, stderr for json and csv), warns when `dedupe` has never run or is out of date, and proceeds without exclusions.
+- Merge requests are matched to their commits by `(project, iid)` where project is the GitLab project id or the GitHub `owner/name` from `web_url`, never the short name alone (iids restart in every project). A `merge_commit_sha` that is one of the MR's own commits (a fast-forward head) is not treated as a duplicate.
+- Implemented in Python on top of `Storage`, not per-backend SQL, so DuckDB and BigQuery behave the same and the rules are testable offline. `diffs` is streamed twice (fingerprints are 64-bit ints) and never loaded whole.
+
+### Fixed
+
+- GitHub extractor: the PR dedup query and the `mr_id` lookup filtered `merge_requests` on `project_path`, a column that does not exist, and the error was swallowed. PRs were never deduplicated and `mr_commits.mr_id` was always empty. Both now use the real columns (`mr_id` comes from the PR row itself), and query errors are no longer swallowed.
+- Re-extraction no longer double-inserts merge requests on either platform (GitLab never deduplicated at all). An MR is stored again only when it is new, changed (`updated_at` or `state`) or has gained a merge/squash sha its stored row lacks; GitLab MR-commit links already stored are not added again. Rows are still never updated: a changed MR is a newer version. Every reader takes the version with the latest `extracted_at` per `mr_id` (`lib/merge_requests.py`): `merge_velocity` and `code_efficiency` in `analyze.py` (the latter joined `merge_requests` to commits, so duplicate MR rows multiplied its additions), and `dedupe`, so stores that were already duplicated read correctly.
+- GitLab extraction with `--full` and no `--since`/`--until` compared a string with None (`since` and `until` are now optional bounds, and so is `until` on an incremental run, which failed the same way).
+
+### Upgrade notes
+
+- Run `/coding-productivity:dedupe` (or `scripts/dedupe.py`) once, then after every extraction. Until then `analyze` warns and numbers are unchanged.
+- Merge requests extracted before 0.14 have NULL shas, so the squash and promotion rules find nothing for them until the period is extracted again (`extract --since ... --until ...`, plus `--full` on GitHub). Re-extraction now stores such an MR once more, with its sha, and nothing else; the merge, copy and moved-code rules work on existing data.
+- Trends computed before and after the first dedupe run are not comparable; recompute any figure you published.
+
 ## 0.13.0
 
 The scoring model is now a measuring instrument: one series = one model. Model upgrades used to change the score scale silently (the scorer auto-discovered "the latest Haiku" at run time; on 150 real commits Haiku 5.5 scored 0.74x Haiku 4.5, and the ratio differed by period), so trends that crossed a model change were inflated. Switching models now means a full rescore (rebase), never splicing.

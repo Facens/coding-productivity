@@ -6,7 +6,7 @@ argument-hint: '[date range, e.g. "January 2026", "last 3 months", "2025-06 to 2
 
 # Run Full Pipeline
 
-Run extract -> score (if enabled) -> analyze -> report in sequence for a given time period.
+Run extract -> score (if enabled) -> dedupe -> analyze -> report in sequence for a given time period.
 
 ## Step 1: Parse Date Range
 
@@ -71,7 +71,17 @@ The model is `SCORING_MODEL` from the config; the script refuses to append score
 If scoring is disabled, skip this step and tell the user:
 > Scoring is disabled. Run `/coding-productivity:setup` to enable it, or use `/coding-productivity:analyze` for raw metrics.
 
-## Step 5: Analyze
+## Step 5: Detect Duplicate Work
+
+Run after scoring, so analysis excludes work the commits table counts more than once (merge, squash, promotion and copied commits, moved code):
+
+```bash
+{venv_python} {scripts_dir}/dedupe.py --config .coding-productivity.env
+```
+
+It compares every commit with all the others, so it always covers the whole dataset, not just the requested range. Show its output (excluded commits per rule, files with moved code). If it notes that merged MRs/PRs carry no merge/squash sha, pass that on: the squash and promotion rules need merge requests extracted with v0.14 or later (see `/coding-productivity:dedupe`).
+
+## Step 6: Analyze
 
 Run all analysis queries:
 
@@ -82,11 +92,11 @@ Run all analysis queries:
 {venv_python} {scripts_dir}/analyze.py --config .coding-productivity.env --query merge_velocity --since {since} --until {until}
 ```
 
-Display all results to the user as markdown tables.
+Display all results to the user as markdown tables, with the `excluded: ...` line the script prints for the range.
 
 If an analysis exits with an error that the date range mixes scoring models, stop and explain it (a trend across two models is a trend in the instrument). Offer a narrower range, or `/coding-productivity:calibrate` then `/coding-productivity:rebase`.
 
-## Step 6: Summary
+## Step 7: Summary
 
 After all steps complete, display:
 
@@ -95,6 +105,7 @@ Pipeline complete for {date_range}.
 
 Extraction:  {commit_count} commits from {repo_count} repos
 Scoring:     {scored_count} commits scored (or "Skipped -- not enabled")
+Duplicates:  {excluded_count} commits excluded, {moved_files} files with moved code
 Analysis:    4 reports generated
 
 Next steps:
