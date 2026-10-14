@@ -117,6 +117,8 @@ python3.14 scripts/analyze.py --config .coding-productivity.env \
 
 If a score-based query exits with an error that the date range mixes scoring models, stop and tell the user: a report across two models would present a change of instrument as a change in productivity. Offer to narrow the range to one model, or to run `/coding-productivity:calibrate` and `/coding-productivity:rebase`. Pass `--allow-legacy-null` only if the user confirms that scores with no recorded model come from the same model as the rest.
 
+Every analysis run prints, on stderr when the format is json, an `excluded: N commits (...), moved-code discount X% of productivity` line for its range, and a WARNING when duplicate-work detection has never run or is out of date. Offer to run `/coding-productivity:dedupe` first when it warns, and state in the report how much duplicate work was excluded (or that none was, because dedupe has not run), so readers know the totals are net of it.
+
 When scoring data is included, state in the report which `scorer_model` produced the scores (shown by the `score` skill summary or the `scoring_meta` table) so readers know the instrument.
 
 ## Step 5: Compose the Report

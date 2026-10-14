@@ -403,6 +403,9 @@ def _extract_pull_requests(
                 "closed_at": closed_at,
                 "source_branch": pr.get("head", {}).get("ref", ""),
                 "target_branch": pr.get("base", {}).get("ref", ""),
+                # An open PR's merge_commit_sha is a throwaway test merge.
+                "merge_commit_sha": (pr.get("merge_commit_sha") or None) if merged_at else None,
+                "squash_commit_sha": None,  # GitHub has one field for every merge method
                 "additions": pr.get("additions", 0) or 0,
                 "deletions": pr.get("deletions", 0) or 0,
                 "web_url": pr.get("html_url", ""),

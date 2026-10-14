@@ -28,10 +28,14 @@ import json
 import sys
 from datetime import date, datetime
 from pathlib import Path
+from typing import Optional
 
 # Ensure the lib package is importable when running as a script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from dataclasses import dataclass, field
+
+from lib import duplicate_work as dw
 from lib import scoring_meta
 from lib.config import Config
 from lib.storage import get_storage, is_table_missing, Storage
@@ -109,6 +113,152 @@ def _has_scores(storage: Storage) -> bool:
         if not is_table_missing(exc):
             raise
         return False
+
+
+# ── Duplicate work: exclusion and moved-code discount ────────────────────────
+
+@dataclass
+class _Source:
+    """Where a query reads scores and line counts, with or without dedupe.
+
+    ``scores`` names a table/CTE with ``commit_sha, total_productivity,
+    weighted_score, overall_category``. After a dedupe run those are
+    recomputed from the active series' file scores times the moved-code
+    factor (file rows deduplicated per ``(commit_sha, file_path)`` first, then
+    ``score * max(additions, 1) * factor`` as at scoring time); a commit with
+    no file rows keeps its stored totals. ``lines_join`` / ``lines_sum`` do
+    the same for the unscored lines-changed metric, and ``excl`` holds the
+    WHERE clause that drops ``duplicate_commits``.
+    """
+    ctes: list[str] = field(default_factory=list)
+    scores: str = ""
+    lines_join: str = ""
+    lines_sum: str = "SUM(c.additions + c.deletions)"
+    excl: list[str] = field(default_factory=list)
+
+
+_NOT_DUPLICATE = "c.commit_sha NOT IN (SELECT commit_sha FROM duplicate_commits)"
+
+
+def _dedupe_ctes(storage: Storage) -> list[str]:
+    """``dd_diffs``: one row per (commit, file) with its moved-code factor."""
+    # Constants, not user input, so they are written into the SQL.
+    thr = float(dw.MOVED_DISCOUNT_SHARE)
+    return [f"""dd_diffs AS (
+        SELECT d.commit_sha, d.file_path,
+               COALESCE(d.additions, 0) AS additions,
+               COALESCE(d.deletions, 0) AS deletions,
+               CASE WHEN m.moved_share >= {thr} THEN 1 - m.moved_share ELSE 1 END AS factor
+        FROM (
+            SELECT commit_sha, file_path, additions, deletions,
+                   ROW_NUMBER() OVER (PARTITION BY commit_sha, file_path
+                                      ORDER BY extracted_at DESC) AS rn
+            FROM diffs
+        ) d
+        LEFT JOIN file_moved_share m
+               ON m.commit_sha = d.commit_sha AND m.file_path = d.file_path
+        WHERE d.rn = 1
+    )"""]
+
+
+def _dedupe_file_scores_cte(storage: Storage) -> str:
+    """``dd_files``: active series' file scores, deduplicated, with factor."""
+    file_table = scoring_meta.get_active(storage).file_table
+    return f"""dd_files AS (
+        SELECT f.commit_sha, f.file_path, f.score,
+               d.additions, d.deletions, d.factor
+        FROM (
+            SELECT commit_sha, file_path, score,
+                   ROW_NUMBER() OVER (PARTITION BY commit_sha, file_path
+                                      ORDER BY scored_at DESC) AS rn
+            FROM {file_table}
+        ) f
+        JOIN dd_diffs d ON d.commit_sha = f.commit_sha AND d.file_path = f.file_path
+        WHERE f.rn = 1
+    )"""
+
+
+def _source(storage: Storage, scored: bool) -> _Source:
+    """Scores/lines source for a query. Plain tables until dedupe has run."""
+    commit_table = _commit_scores_table(storage)
+    if dw.last_run(storage) is None:
+        return _Source(scores=commit_table)
+    src = _Source(excl=[_NOT_DUPLICATE])
+    src.ctes = _dedupe_ctes(storage)
+    if scored:
+        src.ctes += [
+            _dedupe_file_scores_cte(storage),
+            """adj_commit AS (
+        SELECT commit_sha,
+               SUM(score * GREATEST(additions, 1) * factor) AS productivity,
+               SUM((additions + deletions) * factor) AS lines
+        FROM dd_files GROUP BY commit_sha
+    )""",
+            f"""adj_scores AS (
+        SELECT s.commit_sha,
+               COALESCE(a.productivity, s.total_productivity) AS total_productivity,
+               CASE WHEN a.commit_sha IS NULL THEN s.weighted_score
+                    ELSE a.productivity / NULLIF(a.lines, 0) END AS weighted_score,
+               s.overall_category
+        FROM {commit_table} s
+        LEFT JOIN adj_commit a ON a.commit_sha = s.commit_sha
+    )""",
+        ]
+        src.scores = "adj_scores"
+    else:
+        src.ctes.append("""adj_lines AS (
+        SELECT commit_sha, SUM((additions + deletions) * factor) AS lines
+        FROM dd_diffs GROUP BY commit_sha
+    )""")
+        src.lines_join = "LEFT JOIN adj_lines al ON al.commit_sha = c.commit_sha"
+        src.lines_sum = ("ROUND(SUM(COALESCE(al.lines, c.additions + c.deletions)), 1)")
+    return src
+
+
+def _with(*ctes: str) -> str:
+    """``WITH a AS (...), b AS (...)`` from CTE definitions; '' when none."""
+    ctes = [c for c in ctes if c]
+    return "WITH " + ",\n".join(ctes) + "\n" if ctes else ""
+
+
+def _cte_prefix(ctes: list[str]) -> str:
+    """Opening of a ``WITH`` that goes on with the query's own CTEs."""
+    return "WITH " + "".join(c + ",\n" for c in ctes)
+
+
+def dedupe_summary(storage: Storage, config: Config, since: str, until: str) -> Optional[str]:
+    """One line on what dedupe removed from ``[since, until)``; None if it never ran."""
+    if dw.last_run(storage) is None:
+        return None
+    where, params = _build_where(config, since, until)
+    by_rule = {r["why"]: r["n"] for r in storage.query(f"""
+        SELECT d.why AS why, COUNT(*) AS n
+        FROM commits c JOIN duplicate_commits d ON d.commit_sha = c.commit_sha
+        {where} GROUP BY d.why""", params)}
+    total = sum(by_rule.values())
+    detail = " / ".join(f"{rule} {by_rule.get(rule, 0):,}" for rule in dw.RULE_ORDER)
+
+    scored = _has_scores(storage)
+    where, params = _build_where(config, since, until, [_NOT_DUPLICATE])
+    if scored:
+        ctes = _dedupe_ctes(storage) + [_dedupe_file_scores_cte(storage)]
+        raw, adj, noun = ("x.score * GREATEST(x.additions, 1)",
+                          "x.score * GREATEST(x.additions, 1) * x.factor", "productivity")
+        table = "dd_files"
+    else:
+        ctes = _dedupe_ctes(storage)
+        raw, adj, noun = ("x.additions + x.deletions",
+                          "(x.additions + x.deletions) * x.factor", "lines changed")
+        table = "dd_diffs"
+    rows = storage.query(f"""
+        {_with(*ctes)}SELECT SUM({raw}) AS raw_total, SUM({adj}) AS adj_total
+        FROM {table} x JOIN commits c ON c.commit_sha = x.commit_sha
+        {where}""", params)
+    raw_v = (rows[0]["raw_total"] or 0) if rows else 0
+    adj_v = (rows[0]["adj_total"] or 0) if rows else 0
+    pct = (raw_v - adj_v) / raw_v * 100 if raw_v else 0.0
+    return (f"excluded: {total:,} commits ({detail}), "
+            f"moved-code discount {pct:.1f}% of {noun}")
 
 
 class MixedScorerModelError(RuntimeError):
@@ -207,31 +357,32 @@ def monthly_trends(storage: Storage, config: Config,
                    since: str, until: str) -> list[dict]:
     """Monthly commit count, total productivity, avg weighted score, unique authors."""
     scored = _has_scores(storage)
-    scores = _commit_scores_table(storage)
-    where, params = _build_where(config, since, until)
+    src = _source(storage, scored)
+    where, params = _build_where(config, since, until, src.excl)
 
     if scored:
         sql = f"""
-        SELECT
+        {_with(*src.ctes)}SELECT
             date_trunc('month', c.authored_date) AS month,
             COUNT(DISTINCT c.commit_sha) AS commits,
             COUNT(DISTINCT c.author_email) AS unique_authors,
             ROUND(COALESCE(SUM(s.total_productivity), 0), 2) AS total_productivity,
             ROUND(COALESCE(AVG(s.weighted_score), 0), 3) AS avg_weighted_score
         FROM commits c
-        LEFT JOIN {scores} s ON c.commit_sha = s.commit_sha
+        LEFT JOIN {src.scores} s ON c.commit_sha = s.commit_sha
         {where}
         GROUP BY date_trunc('month', c.authored_date)
         ORDER BY month
         """
     else:
         sql = f"""
-        SELECT
+        {_with(*src.ctes)}SELECT
             date_trunc('month', c.authored_date) AS month,
             COUNT(DISTINCT c.commit_sha) AS commits,
             COUNT(DISTINCT c.author_email) AS unique_authors,
-            SUM(c.additions + c.deletions) AS total_lines_changed
+            {src.lines_sum} AS total_lines_changed
         FROM commits c
+        {src.lines_join}
         {where}
         GROUP BY date_trunc('month', c.authored_date)
         ORDER BY month
@@ -245,13 +396,13 @@ def period_comparison(storage: Storage, config: Config,
                       comparison_start: str, comparison_end: str) -> list[dict]:
     """Before/after metrics with percentage change."""
     scored = _has_scores(storage)
-    scores = _commit_scores_table(storage)
+    src = _source(storage, scored)
 
     # Build repo and exclusion filters once.
     repo_clause, repo_params = _repo_filter(config)
     excl_clause, excl_params = _excluded_devs_filter(config)
 
-    extra = []
+    extra = list(src.excl)
     if repo_clause:
         extra.append(repo_clause)
     if excl_clause:
@@ -269,7 +420,7 @@ def period_comparison(storage: Storage, config: Config,
 
     if scored:
         sql = f"""
-        WITH baseline AS (
+        {_cte_prefix(src.ctes)}baseline AS (
             SELECT
                 COUNT(DISTINCT c.commit_sha) AS commits,
                 COUNT(DISTINCT c.author_email) AS unique_authors,
@@ -277,7 +428,7 @@ def period_comparison(storage: Storage, config: Config,
                 ROUND(COALESCE(AVG(s.weighted_score), 0), 3) AS avg_weighted_score,
                 COUNT(DISTINCT CAST(c.authored_date AS DATE)) AS active_days
             FROM commits c
-            LEFT JOIN {scores} s ON c.commit_sha = s.commit_sha
+            LEFT JOIN {src.scores} s ON c.commit_sha = s.commit_sha
             WHERE c.authored_date >= $b_start AND c.authored_date < $b_end
                   {extra_sql}
         ),
@@ -289,7 +440,7 @@ def period_comparison(storage: Storage, config: Config,
                 ROUND(COALESCE(AVG(s.weighted_score), 0), 3) AS avg_weighted_score,
                 COUNT(DISTINCT CAST(c.authored_date AS DATE)) AS active_days
             FROM commits c
-            LEFT JOIN {scores} s ON c.commit_sha = s.commit_sha
+            LEFT JOIN {src.scores} s ON c.commit_sha = s.commit_sha
             WHERE c.authored_date >= $c_start AND c.authored_date < $c_end
                   {extra_sql}
         )
@@ -307,13 +458,14 @@ def period_comparison(storage: Storage, config: Config,
         """
     else:
         sql = f"""
-        WITH baseline AS (
+        {_cte_prefix(src.ctes)}baseline AS (
             SELECT
                 COUNT(DISTINCT c.commit_sha) AS commits,
                 COUNT(DISTINCT c.author_email) AS unique_authors,
-                SUM(c.additions + c.deletions) AS total_lines_changed,
+                {src.lines_sum} AS total_lines_changed,
                 COUNT(DISTINCT CAST(c.authored_date AS DATE)) AS active_days
             FROM commits c
+            {src.lines_join}
             WHERE c.authored_date >= $b_start AND c.authored_date < $b_end
                   {extra_sql}
         ),
@@ -321,9 +473,10 @@ def period_comparison(storage: Storage, config: Config,
             SELECT
                 COUNT(DISTINCT c.commit_sha) AS commits,
                 COUNT(DISTINCT c.author_email) AS unique_authors,
-                SUM(c.additions + c.deletions) AS total_lines_changed,
+                {src.lines_sum} AS total_lines_changed,
                 COUNT(DISTINCT CAST(c.authored_date AS DATE)) AS active_days
             FROM commits c
+            {src.lines_join}
             WHERE c.authored_date >= $c_start AND c.authored_date < $c_end
                   {extra_sql}
         )
@@ -362,13 +515,13 @@ def author_productivity(storage: Storage, config: Config,
                         since: str, until: str, limit: int = 20) -> list[dict]:
     """Per-author: commits, total productivity, avg score, top category."""
     scored = _has_scores(storage)
-    scores = _commit_scores_table(storage)
-    where, params = _build_where(config, since, until)
+    src = _source(storage, scored)
+    where, params = _build_where(config, since, until, src.excl)
     params["lim"] = limit
 
     if scored:
         sql = f"""
-        WITH author_stats AS (
+        {_cte_prefix(src.ctes)}author_stats AS (
             SELECT
                 c.author_name,
                 c.author_email,
@@ -376,7 +529,7 @@ def author_productivity(storage: Storage, config: Config,
                 ROUND(COALESCE(SUM(s.total_productivity), 0), 2) AS total_productivity,
                 ROUND(COALESCE(AVG(s.weighted_score), 0), 3) AS avg_weighted_score
             FROM commits c
-            LEFT JOIN {scores} s ON c.commit_sha = s.commit_sha
+            LEFT JOIN {src.scores} s ON c.commit_sha = s.commit_sha
             {where}
             GROUP BY c.author_name, c.author_email
         ),
@@ -389,7 +542,7 @@ def author_productivity(storage: Storage, config: Config,
                     PARTITION BY c.author_email ORDER BY COUNT(*) DESC
                 ) AS rn
             FROM commits c
-            JOIN {scores} s ON c.commit_sha = s.commit_sha
+            JOIN {src.scores} s ON c.commit_sha = s.commit_sha
             {where}
             GROUP BY c.author_email, s.overall_category
         )
@@ -408,12 +561,13 @@ def author_productivity(storage: Storage, config: Config,
         """
     else:
         sql = f"""
-        SELECT
+        {_with(*src.ctes)}SELECT
             c.author_name,
             c.author_email,
             COUNT(DISTINCT c.commit_sha) AS commits,
-            SUM(c.additions + c.deletions) AS total_lines_changed
+            {src.lines_sum} AS total_lines_changed
         FROM commits c
+        {src.lines_join}
         {where}
         GROUP BY c.author_name, c.author_email
         ORDER BY total_lines_changed DESC
@@ -496,17 +650,17 @@ def category_distribution(storage: Storage, config: Config,
     if not _has_scores(storage):
         return []
 
-    scores = _commit_scores_table(storage)
-    where, params = _build_where(config, since, until)
+    src = _source(storage, True)
+    where, params = _build_where(config, since, until, src.excl)
 
     sql = f"""
-    WITH cats AS (
+    {_cte_prefix(src.ctes)}cats AS (
         SELECT
             s.overall_category AS category,
             COUNT(*) AS commit_count,
             ROUND(AVG(s.weighted_score), 3) AS avg_score
         FROM commits c
-        JOIN {scores} s ON c.commit_sha = s.commit_sha
+        JOIN {src.scores} s ON c.commit_sha = s.commit_sha
         {where}
         GROUP BY s.overall_category
     ),
@@ -532,7 +686,11 @@ def code_efficiency(storage: Storage, config: Config,
     repo_clause, repo_params = _repo_filter(config)
     excl_clause, excl_params = _excluded_devs_filter(config)
 
+    # Duplicate commits are excluded; additions are not moved-code discounted
+    # (this is a ratio of raw additions, not a productivity figure).
     clauses = ["c.authored_date >= $since", "c.authored_date < $until"]
+    if dw.last_run(storage) is not None:
+        clauses.append(_NOT_DUPLICATE)
     if repo_clause:
         clauses.append(repo_clause)
     if excl_clause:
@@ -671,6 +829,40 @@ def _period_ranges(args) -> list[tuple[str, str]]:
     ]
 
 
+def check_dedupe(storage: Storage, require: bool = False) -> list[str]:
+    """Warnings about the state of duplicate-work detection.
+
+    Raises ``DedupeRequiredError`` instead when *require* is set and it has
+    never run. Never-run is not an error by default: analysis proceeds without
+    exclusions and says so.
+    """
+    run = dw.last_run(storage)
+    if run is None:
+        msg = ("duplicate-work detection has never run: duplicates (merge, squash, "
+               "promotion and copied commits, moved code) are still counted. Run "
+               "/coding-productivity:dedupe, or scripts/dedupe.py.")
+        if require:
+            raise DedupeRequiredError(msg)
+        return [f"WARNING: {msg}"]
+    warnings = []
+    if run["rules_version"] != dw.DEDUPE_RULES_VERSION:
+        warnings.append(
+            f"WARNING: the last dedupe run used rules v{run['rules_version']}, this "
+            f"plugin has v{dw.DEDUPE_RULES_VERSION}. Run dedupe again."
+        )
+    now = storage.count("commits")
+    if run["commits"] != now:
+        warnings.append(
+            f"WARNING: the commits table has {now:,} commits, {run['commits']:,} when "
+            "dedupe last ran. Run dedupe again so new commits are checked."
+        )
+    return warnings
+
+
+class DedupeRequiredError(RuntimeError):
+    """``--require-dedupe`` was passed but dedupe has never run."""
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -706,10 +898,20 @@ def main():
              "one recorded model is always refused.",
     )
 
+    parser.add_argument(
+        "--require-dedupe", action="store_true",
+        help="Fail (exit 2) if duplicate-work detection has never run, instead "
+             "of warning and analyzing without exclusions.",
+    )
+
     args = parser.parse_args()
 
     config = Config(args.config)
     storage = get_storage(config)
+
+    def note(msg: str) -> None:
+        # Notes must not corrupt machine-readable output.
+        print(msg, file=sys.stdout if args.output_format == "table" else sys.stderr)
 
     try:
         # Determine queries to run.
@@ -733,6 +935,24 @@ def main():
                 except MixedScorerModelError as exc:
                     print(f"Error: {exc}", file=sys.stderr)
                     sys.exit(2)
+
+        # Duplicate work: warn (or refuse) when it never ran, else say what it removed.
+        try:
+            for warning in check_dedupe(storage, require=args.require_dedupe):
+                print(warning, file=sys.stderr)
+        except DedupeRequiredError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(2)
+        if "period_comparison" in query_names:
+            labelled = [("baseline", args.baseline_start, args.baseline_end),
+                        ("comparison", args.comparison_start, args.comparison_end)]
+        else:
+            labelled = [("", args.since, args.until)]
+        for label, start, end in labelled:
+            if start and end:
+                line = dedupe_summary(storage, config, start, end)
+                if line:
+                    note(f"{label + ' ' if label else ''}{line}")
 
         for qname in query_names:
             if qname == "period_comparison":

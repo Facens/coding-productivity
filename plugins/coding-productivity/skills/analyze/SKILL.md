@@ -39,6 +39,8 @@ st.close()
 - If `COMMITS:0`, tell the user: "No commit data found. Run `/coding-productivity:extract` first to pull data." and stop.
 - Parse the counts. If `SCORES:0`, note that AI scoring data is unavailable and only raw metrics will be shown.
 
+Duplicate work (merge, squash, promotion and copied commits, moved code) is excluded from every commit-based metric once `/coding-productivity:dedupe` has run. If `analyze.py` warns that it has never run, or that the commits table changed since the last run, tell the user and offer to run `/coding-productivity:dedupe` first. Pass `--require-dedupe` to make a missing run an error instead of a warning.
+
 ## Step 2: Ask What Analysis to Run
 
 Ask the user:
@@ -94,7 +96,7 @@ python3.14 scripts/analyze.py --config .coding-productivity.env \
 
 ## Step 5: Display Results
 
-Present the script output directly. It is already formatted as markdown tables.
+Present the script output directly. It is already formatted as markdown tables. Keep the `excluded: N commits (...), moved-code discount X% of productivity` line that precedes them: it says how much duplicate work was removed from the selected range.
 
 If the script exits with a message that the date range mixes scoring models (or mixes legacy scores with a recorded model), do not work around it. Explain that a trend across two models is a trend in the instrument, and offer:
 

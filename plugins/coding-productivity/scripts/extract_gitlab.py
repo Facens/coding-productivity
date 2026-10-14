@@ -319,6 +319,7 @@ def _extract_merge_requests(
             continue
 
         # Build MR record matching the schema
+        merged = mr.get("state") == "merged"
         changes = mr.get("changes", {})
         mr_record = {
             "mr_id": str(mr["id"]),
@@ -336,6 +337,8 @@ def _extract_merge_requests(
             "closed_at": _parse_date(mr.get("closed_at")),
             "source_branch": mr.get("source_branch"),
             "target_branch": mr.get("target_branch"),
+            "merge_commit_sha": (mr.get("merge_commit_sha") or None) if merged else None,
+            "squash_commit_sha": (mr.get("squash_commit_sha") or None) if merged else None,
             "additions": mr.get("additions"),
             "deletions": mr.get("deletions"),
             "web_url": mr.get("web_url"),
