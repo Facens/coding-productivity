@@ -43,7 +43,7 @@ python3.14 scripts/dedupe.py --config .coding-productivity.env [--dry-run]
 
 The script prints the number of excluded commits per rule and the number of files with moved code. Show it to the user.
 
-If it prints a note that merged MRs/PRs carry no merge/squash commit sha, the data was extracted before v0.14: the squash and promotion rules cannot see those MRs yet, and the merge, copy and moved-code rules are unaffected. Tell the user, and offer to re-extract the period so the shas are stored (merge requests are fetched again with `extract --since <date> --until <date>`, plus `--full` on GitHub), then run this skill again:
+If it prints a note that merged MRs/PRs carry no merge/squash commit sha, the data was extracted before v0.14: the squash and promotion rules cannot see those MRs yet, and the merge, copy and moved-code rules are unaffected. Tell the user, and offer to re-extract the period so the shas are stored (merge requests are fetched again with `extract --since <date> --until <date>`, plus `--full` on GitHub), then run this skill again. Ask via `AskUserQuestion`:
 
 > 1. Re-extract now
 > 2. Continue with merge, copy and moved-code detection only

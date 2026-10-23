@@ -141,7 +141,22 @@ class _Source:
 _NOT_DUPLICATE = "c.commit_sha NOT IN (SELECT commit_sha FROM duplicate_commits)"
 
 
-def _dedupe_ctes(storage: Storage) -> list[str]:
+def _productivity_sql(prefix: str = "") -> tuple[str, str]:
+    """``(raw, adjusted)`` productivity over ``dd_files`` rows (columns behind
+    *prefix*). Defined once: the ``adj_commit`` CTE applies it and the summary's
+    moved-code discount is measured with it."""
+    raw = f"{prefix}score * GREATEST({prefix}additions, 1)"
+    return raw, f"{raw} * {prefix}factor"
+
+
+def _lines_sql(prefix: str = "") -> tuple[str, str]:
+    """``(raw, adjusted)`` lines changed, the unscored counterpart of
+    ``_productivity_sql``: the CTEs apply it and the summary measures with it."""
+    raw = f"({prefix}additions + {prefix}deletions)"
+    return raw, f"{raw} * {prefix}factor"
+
+
+def _dedupe_ctes() -> list[str]:
     """``dd_diffs``: one row per (commit, file) with its moved-code factor."""
     # Constants, not user input, so they are written into the SQL.
     thr = float(dw.MOVED_DISCOUNT_SHARE)
@@ -185,14 +200,16 @@ def _source(storage: Storage, scored: bool) -> _Source:
     if dw.last_run(storage) is None:
         return _Source(scores=commit_table)
     src = _Source(excl=[_NOT_DUPLICATE])
-    src.ctes = _dedupe_ctes(storage)
+    src.ctes = _dedupe_ctes()
+    _, adj_productivity = _productivity_sql()
+    _, adj_lines = _lines_sql()
     if scored:
         src.ctes += [
             _dedupe_file_scores_cte(storage),
-            """adj_commit AS (
+            f"""adj_commit AS (
         SELECT commit_sha,
-               SUM(score * GREATEST(additions, 1) * factor) AS productivity,
-               SUM((additions + deletions) * factor) AS lines
+               SUM({adj_productivity}) AS productivity,
+               SUM({adj_lines}) AS lines
         FROM dd_files GROUP BY commit_sha
     )""",
             f"""adj_scores AS (
@@ -207,8 +224,8 @@ def _source(storage: Storage, scored: bool) -> _Source:
         ]
         src.scores = "adj_scores"
     else:
-        src.ctes.append("""adj_lines AS (
-        SELECT commit_sha, SUM((additions + deletions) * factor) AS lines
+        src.ctes.append(f"""adj_lines AS (
+        SELECT commit_sha, SUM({adj_lines}) AS lines
         FROM dd_diffs GROUP BY commit_sha
     )""")
         src.lines_join = "LEFT JOIN adj_lines al ON al.commit_sha = c.commit_sha"
@@ -242,14 +259,14 @@ def dedupe_summary(storage: Storage, config: Config, since: str, until: str) -> 
     scored = _has_scores(storage)
     where, params = _build_where(config, since, until, [_NOT_DUPLICATE])
     if scored:
-        ctes = _dedupe_ctes(storage) + [_dedupe_file_scores_cte(storage)]
-        raw, adj, noun = ("x.score * GREATEST(x.additions, 1)",
-                          "x.score * GREATEST(x.additions, 1) * x.factor", "productivity")
+        ctes = _dedupe_ctes() + [_dedupe_file_scores_cte(storage)]
+        raw, adj = _productivity_sql("x.")
+        noun = "productivity"
         table = "dd_files"
     else:
-        ctes = _dedupe_ctes(storage)
-        raw, adj, noun = ("x.additions + x.deletions",
-                          "(x.additions + x.deletions) * x.factor", "lines changed")
+        ctes = _dedupe_ctes()
+        raw, adj = _lines_sql("x.")
+        noun = "lines changed"
         table = "dd_diffs"
     rows = storage.query(f"""
         {_with(*ctes)}SELECT SUM({raw}) AS raw_total, SUM({adj}) AS adj_total
@@ -851,7 +868,8 @@ def check_dedupe(storage: Storage, require: bool = False) -> list[str]:
             f"WARNING: the last dedupe run used rules v{run['rules_version']}, this "
             f"plugin has v{dw.DEDUPE_RULES_VERSION}. Run dedupe again."
         )
-    now = storage.count("commits")
+    # dedupe records distinct shas, so compare the same thing, not row count.
+    now = storage.query("SELECT COUNT(DISTINCT commit_sha) AS n FROM commits")[0]["n"]
     if run["commits"] != now:
         warnings.append(
             f"WARNING: the commits table has {now:,} commits, {run['commits']:,} when "

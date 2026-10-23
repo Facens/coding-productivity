@@ -20,6 +20,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -330,6 +331,22 @@ def _extract_diffs(
 # Pull request extraction
 # ---------------------------------------------------------------------------
 
+def _pr_url_pattern(repo: str) -> str:
+    """Coarse LIKE pattern for the web_url of this repo's PRs (``owner/name`` slug).
+
+    ``_`` is a LIKE wildcard and the two backends escape differently, so it can
+    also match a same-owner repo (``my_repo`` vs ``my-repo``): narrow the rows
+    with ``_is_repo_pr``.
+    """
+    return f"%/{repo.lower()}/pull/%"
+
+
+def _is_repo_pr(web_url: Optional[str], repo: str) -> bool:
+    """Is *web_url* a PR of exactly *repo*?"""
+    m = re.match(r"^https?://[^/]+/(.+?)/pull/\d+", web_url or "")
+    return bool(m) and m.group(1).lower() == repo.lower()
+
+
 def _extract_pull_requests(
     client: GitHubClient,
     storage: Storage,
@@ -339,16 +356,25 @@ def _extract_pull_requests(
     anon_key: Optional[bytes],
     merges: Optional[dict],
     mapping_path: Optional[Path],
+    refreshed: Optional[set] = None,
 ) -> int:
-    """Extract pull requests and insert into storage.  Returns count."""
+    """Extract pull requests and insert into storage.  Returns count.
+
+    The iids of the PRs stored in this run are added to *refreshed*.
+    """
 
     slug = repo.replace("/", "_")
 
     # Latest stored version of every PR of this repo, by PR id. A PR is stored
     # again only when it changed (or gained its merge sha): see needs_refresh.
-    stored = merge_requests.stored_mrs(
-        storage, "m.project_name = $repo_name", {"repo_name": repo.split("/")[-1]}
-    )
+    # Scoped by URL, not short name: same-named repos of two owners share a name.
+    stored = {
+        mr_id: row
+        for mr_id, row in merge_requests.stored_mrs(
+            storage, "LOWER(m.web_url) LIKE $url_pat", {"url_pat": _pr_url_pattern(repo)}
+        ).items()
+        if _is_repo_pr(row["web_url"], repo)
+    }
 
     print(f"[{repo}] {len(stored):,} existing PRs in storage", flush=True)
     print(f"[{repo}] Fetching pull requests...", flush=True)
@@ -417,6 +443,8 @@ def _extract_pull_requests(
 
             batch.append(mr_record)
             inserted += 1
+            if refreshed is not None:
+                refreshed.add(str(pr_number))
 
             if len(batch) >= batch_size:
                 storage.insert_batch("merge_requests", batch)
@@ -443,30 +471,51 @@ def _extract_pr_commit_links(
     storage: Storage,
     repo: str,
     batch_size: int,
+    refreshed: Optional[set] = None,
 ) -> int:
-    """Extract the mapping between PRs and their commits."""
+    """Extract the mapping between PRs and their commits.
+
+    Links are fetched for PRs with none yet and for those in *refreshed* (stored
+    again this run, so their commit list may have grown).
+    """
 
     slug = repo.replace("/", "_")
 
-    # Get PR IIDs that are in storage but have no links yet.
-    # merge_requests stores short project_name (e.g., "admin"),
-    # while repo is full path (e.g., "org/admin").
-    repo_short = repo.split("/")[-1] if "/" in repo else repo
+    # Latest version of each PR of this repo (one row per PR, whatever
+    # re-extraction left). Scoped by URL: merge_requests stores the short name,
+    # which two owners' repos can share.
+    pr_rows = [
+        r for r in storage.query(
+            f"SELECT m.mr_iid AS mr_iid, m.mr_id AS mr_id, m.web_url AS web_url "
+            f"FROM {merge_requests.LATEST_MRS} m WHERE LOWER(m.web_url) LIKE $url_pat",
+            {"url_pat": _pr_url_pattern(repo)},
+        )
+        if _is_repo_pr(r["web_url"], repo)
+    ]
 
-    # Latest version of each PR (one row per PR, whatever re-extraction left).
-    pr_rows = storage.query(
-        f"SELECT m.mr_iid AS mr_iid, m.mr_id AS mr_id FROM {merge_requests.LATEST_MRS} m "
-        "WHERE m.project_name = $repo_name",
-        {"repo_name": repo_short},
-    )
-
-    linked_rows = storage.query(
-        "SELECT DISTINCT mr_iid FROM mr_commits WHERE project_id = $repo_slug",
-        {"repo_slug": repo},
-    )
-    linked_iids = {str(r["mr_iid"]) for r in linked_rows}
-
-    need_links = [r for r in pr_rows if str(r["mr_iid"]) not in linked_iids]
+    linked_iids = {
+        str(r["mr_iid"]) for r in storage.query(
+            "SELECT DISTINCT mr_iid FROM mr_commits WHERE project_id = $repo_slug",
+            {"repo_slug": repo},
+        )
+    }
+    refreshed = refreshed or set()
+    # Commit-level dedupe is only needed for PRs fetched again: read the stored
+    # pairs only then, so a run with nothing refreshed stays one row per PR.
+    linked: set[tuple[str, str]] = set()
+    if refreshed & linked_iids:
+        linked = {
+            (str(r["mr_iid"]), r["commit_sha"])
+            for r in storage.query(
+                "SELECT mr_iid, commit_sha FROM mr_commits WHERE project_id = $repo_slug",
+                {"repo_slug": repo},
+            )
+            if str(r["mr_iid"]) in refreshed
+        }
+    need_links = [
+        r for r in pr_rows
+        if str(r["mr_iid"]) not in linked_iids or str(r["mr_iid"]) in refreshed
+    ]
     if not need_links:
         print(f"[{repo}] No new PR-commit links to extract", flush=True)
         return 0
@@ -487,10 +536,14 @@ def _extract_pr_commit_links(
 
         mr_id = row["mr_id"] or ""
 
+        iid_s = str(row["mr_iid"])
         for pc in pr_commits:
+            if (iid_s, pc["sha"]) in linked:
+                continue
+            linked.add((iid_s, pc["sha"]))
             link_record: dict = {
                 "mr_id": mr_id,
-                "mr_iid": str(iid),
+                "mr_iid": iid_s,
                 "commit_sha": pc["sha"],
                 "project_id": repo,
                 "extracted_at": _now_iso(),
@@ -535,6 +588,7 @@ def _process_repo(
     print(f"{'='*60}", flush=True)
 
     stats: dict = {"commits": 0, "diffs": 0, "prs": 0, "pr_commits": 0}
+    refreshed: set[str] = set()
 
     try:
         # 1. Commits
@@ -560,12 +614,14 @@ def _process_repo(
             batch_size=batch_size,
             anon_key=anon_key, merges=merges,
             mapping_path=mapping_path,
+            refreshed=refreshed,
         )
 
         # 4. PR-commit links
         stats["pr_commits"] = _extract_pr_commit_links(
             client, storage, repo,
             batch_size=batch_size,
+            refreshed=refreshed,
         )
 
         # All phases complete -- clear checkpoint.

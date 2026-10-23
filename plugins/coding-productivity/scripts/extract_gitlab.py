@@ -394,8 +394,10 @@ def _extract_merge_requests(
 
         # Flush
         if len(mrs_batch) >= batch_size:
-            storage.insert_batch("merge_requests", mrs_batch)
+            # Links first: the MR row marks the MR complete, so a failed link
+            # insert leaves the MR unstored and the next run fetches it again.
             storage.insert_batch("mr_commits", mr_commits_batch)
+            storage.insert_batch("merge_requests", mrs_batch)
             total_mrs += len(mrs_batch)
             total_mr_commits += len(mr_commits_batch)
             print(
@@ -407,8 +409,8 @@ def _extract_merge_requests(
 
     # Flush remaining
     if mrs_batch:
-        storage.insert_batch("merge_requests", mrs_batch)
         storage.insert_batch("mr_commits", mr_commits_batch)
+        storage.insert_batch("merge_requests", mrs_batch)
         total_mrs += len(mrs_batch)
         total_mr_commits += len(mr_commits_batch)
 

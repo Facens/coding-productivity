@@ -295,3 +295,83 @@ def test_bigquery_replace_table_uses_a_truncating_load_job(monkeypatch):
     assert cfg.write_disposition == "WRITE_TRUNCATE"
     st.replace_table("duplicate_commits", [])  # an empty load job is rejected: TRUNCATE
     assert st._client.queries == ["TRUNCATE TABLE `proj.ds.duplicate_commits`"]
+
+
+class _Row:
+    """Stands in for a BigQuery ``Row``: mapping-like, but not a dict."""
+
+    def __init__(self, **values):
+        self._values = values
+
+    def keys(self):
+        return self._values.keys()
+
+    def __getitem__(self, key):
+        return self._values[key]
+
+
+class _PagedJob:
+    def __init__(self, client):
+        self._client = client
+
+    def result(self, page_size=None):
+        self._client.page_sizes.append(page_size)
+        return iter([_Row(a=1, b="x"), _Row(a=2, b="y")])
+
+
+class _QueryClient(_ReplaceClient):
+    def __init__(self, project=None):
+        super().__init__(project)
+        self.job_configs, self.page_sizes = [], []
+
+    def query(self, sql, job_config=None):
+        self.queries.append(sql)
+        self.job_configs.append(job_config)
+        return _PagedJob(self)
+
+
+def test_bigquery_iter_query_rewrites_params_pages_and_yields_dicts(monkeypatch):
+    _fake_bq(monkeypatch)
+    bq = sys.modules["google.cloud.bigquery"]
+    bq.Client = _QueryClient
+    bq.QueryJobConfig = lambda **kw: types.SimpleNamespace(**kw)
+    bq.ScalarQueryParameter = lambda name, kind, value: (name, kind, value)
+    from lib.storage import BigQueryStorage
+
+    st = BigQueryStorage("proj", "ds")
+    rows = st.iter_query("SELECT a, b FROM t WHERE p = $p", {"p": "x"}, page_size=7)
+    assert not isinstance(rows, list)  # a generator: nothing is sent until iterated
+    got = list(rows)
+    assert st._client.queries == ["SELECT a, b FROM t WHERE p = @p"]
+    assert st._client.page_sizes == [7]
+    assert st._client.job_configs[0].query_parameters == [("p", "STRING", "x")]
+    assert got == [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]
+    assert all(type(r) is dict for r in got)
+
+
+# ── Moved-share boundary and the commit-count staleness check ────────────────
+
+@pytest.mark.parametrize("share, productivity", [
+    (0.5, 5.0),    # exactly at the threshold: discounted, factor 1 - 0.5
+    (0.49, 10.0),  # just below: kept whole
+])
+def test_moved_share_threshold_is_inclusive(duckdb_storage, share, productivity):
+    st = duckdb_storage
+    st.insert_batch("commits", [commit("m1", date="2026-01-10T10:00:00Z", adds=10)])
+    st.insert_batch("diffs", [diff("m1", "a.py", "+x", 10, 0)])
+    st.insert_batch("commit_scores", [score("m1", 99.0, 0.5)])
+    st.insert_batch("file_scores", [fscore("m1", "a.py", 1.0)])
+    st.insert_batch("file_moved_share", [
+        {"commit_sha": "m1", "file_path": "a.py", "qualifying_lines": 10,
+         "moved_lines": 5, "moved_share": share, "rules_version": dw.DEDUPE_RULES_VERSION}])
+    marker(st, commits=1)
+    row = analyze.monthly_trends(st, CFG, *JAN)[0]
+    assert row["total_productivity"] == pytest.approx(productivity)
+
+
+def test_a_repeated_sha_does_not_make_the_run_look_stale(duckdb_storage):
+    st = duckdb_storage
+    # Dedupe records distinct shas: 2 here, though the table has 3 rows.
+    st.insert_batch("commits", [commit("d1"), commit("d1"), commit("d2")])
+    marker(st, commits=2)
+    assert analyze.check_dedupe(st) == []

@@ -30,7 +30,8 @@ def stored_mrs(storage, where: str, params: dict) -> dict[str, dict]:
     """``{mr_id: latest row}`` for the MRs matching *where* (an SQL condition on ``m``)."""
     rows = storage.query(
         "SELECT m.mr_id AS mr_id, m.state AS state, m.updated_at AS updated_at, "
-        "m.merge_commit_sha AS merge_commit_sha, m.squash_commit_sha AS squash_commit_sha "
+        "m.merge_commit_sha AS merge_commit_sha, m.squash_commit_sha AS squash_commit_sha, "
+        "m.web_url AS web_url "
         f"FROM {LATEST_MRS} m WHERE {where}",
         params,
     )

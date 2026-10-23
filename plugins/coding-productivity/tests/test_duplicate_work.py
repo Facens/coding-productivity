@@ -133,10 +133,11 @@ def test_fast_forward_head_is_not_a_duplicate(duckdb_storage):
     res = run(
         duckdb_storage,
         [commit("c1", adds=10), commit("head", adds=10, parents="c1"),
-         commit("p1", parents="base"), commit("base")],
+         commit("p1", parents="base"), commit("pb", adds=1), commit("base")],
         mrs=[mr(1, source="staging", merge_sha="head"),
              mr(2, source="staging", merge_sha="p1")],
-        links=[link(1, "c1"), link(1, "head"), link(2, "ghost")],
+        # PR 2's own commit is stored, so p1 is a promotion of work kept elsewhere.
+        links=[link(1, "c1"), link(1, "head"), link(2, "pb")],
     )
     assert res.duplicates == {"p1": "promotion"}  # a real promotion commit still counts
 
@@ -157,6 +158,32 @@ def test_squash_needs_exactly_one_parent_branch_commits_and_a_merged_mr(duckdb_s
     assert res.duplicates == {"two": "merge"}
 
 
+def test_squash_coverage_boundary_is_inclusive(duckdb_storage):
+    res = run(
+        duckdb_storage,
+        [commit("b1", adds=8), commit("sq_at", adds=10, parents="base"),
+         commit("b2", adds=7), commit("sq_under", adds=10, parents="base"),
+         commit("base")],
+        mrs=[mr(1, squash_sha="sq_at"), mr(2, squash_sha="sq_under")],
+        links=[link(1, "b1"), link(2, "b2")],
+    )
+    assert res.duplicates == {"sq_at": "squash"}  # 8/10 = exactly 80% is flagged; 7/10 kept
+
+
+def test_merge_from_base_does_not_count_towards_squash_coverage(duckdb_storage):
+    # The PR's real commits are not stored; its only stored own commit is a
+    # merge of the base branch into it (2 parents, many lines). That must not
+    # push coverage over 80% and drop the only copy of the work.
+    res = run(
+        duckdb_storage,
+        [commit("sync", adds=20, parents="base,upstream"),
+         commit("sq", adds=10, parents="base"), commit("base")],
+        mrs=[mr(1, squash_sha="sq")],
+        links=[link(1, "sync")],
+    )
+    assert res.duplicates == {}
+
+
 def test_duplicate_mr_rows_use_the_newest_non_null_sha(duckdb_storage):
     # Re-extraction inserts the MR again: old NULL row + new filled row, and a
     # still newer row that lost the sha must not hide it.
@@ -175,16 +202,47 @@ def test_duplicate_mr_rows_use_the_newest_non_null_sha(duckdb_storage):
 # ── Rule 3: promotion ────────────────────────────────────────────────────────
 
 def test_promotion_from_long_lived_source_branch(duckdb_storage):
+    # Each promotion lists one stored branch commit, too small to be a squash cover.
     res = run(
         duckdb_storage,
         [commit("p1", parents="base"), commit("p2", parents="base"),
-         commit("p3", parents="base"), commit("f1", parents="base"), commit("base")],
+         commit("p3", parents="base"), commit("f1", parents="base"), commit("base"),
+         commit("b1", adds=1), commit("b2", adds=1), commit("b3", adds=1)],
         mrs=[mr(1, source="staging", merge_sha="p1"),
              mr(2, source="Release/1.2", merge_sha="p2"),
              mr(3, source="develop", squash_sha="p3", project_id="42", name="api"),
              mr(4, source="feature/staging-fix", merge_sha="f1")],
+        links=[link(1, "b1"), link(2, "b2"), link(3, "b3", "42")],
     )
     assert res.duplicates == {"p1": "promotion", "p2": "promotion", "p3": "promotion"}
+
+
+def test_promotion_counts_a_merge_from_base_as_stored_work(duckdb_storage):
+    # The promotion guard asks "is any of the PR's work stored elsewhere?", merge
+    # commits included; only the squash coverage sum ignores them.
+    res = run(
+        duckdb_storage,
+        [commit("p", parents="base"), commit("mb", adds=1, parents="base,gone"),
+         commit("base")],
+        mrs=[mr(1, source="staging", merge_sha="p")],
+        links=[link(1, "mb")],
+    )
+    assert res.duplicates == {"p": "promotion"}
+
+
+def test_squash_from_a_fork_branch_named_main_is_the_only_copy(duckdb_storage):
+    # A fork PR from `main` (GitHub stores only head.ref) or a GitLab fork MR from
+    # `master`: none of its commits are in the table, so the squash commit is the
+    # only stored copy. The branch name alone must not exclude it.
+    res = run(
+        duckdb_storage,
+        [commit("sq", adds=10, parents="base"), commit("sq2", adds=10, parents="base"),
+         commit("base")],
+        mrs=[mr(5, source="main", squash_sha="sq"),
+             mr(6, source="master", squash_sha="sq2", project_id="42", name="api")],
+        links=[link(5, "ghost"), link(6, "ghost2", "42")],
+    )
+    assert res.duplicates == {}
 
 
 def test_first_matching_rule_wins(duckdb_storage):
@@ -336,6 +394,17 @@ def test_boilerplate_lines_in_twenty_files_are_ignored(duckdb_storage):
     assert not any(r["file_path"] == "f1.py" for r in res.moved)
 
 
+def test_exactly_twenty_files_is_boilerplate(duckdb_storage):
+    boiler = "+from some.framework.module import everything_commonly_needed"
+    n = dw.MOVED_BOILERPLATE_FILES
+    res = run(
+        duckdb_storage,
+        [commit(f"c{i}", date=f"2026-01-{10 + i:02d}T10:00:00Z") for i in range(n)],
+        [diff(f"c{i}", f"f{i}.py", added(boiler)) for i in range(n)],
+    )
+    assert res.moved == []  # one file fewer (next test) leaves n - 2 moved rows
+
+
 def test_fewer_than_twenty_files_is_not_boilerplate(duckdb_storage):
     boiler = "+from some.framework.module import everything_commonly_needed"
     n = dw.MOVED_BOILERPLATE_FILES - 1
@@ -345,6 +414,14 @@ def test_fewer_than_twenty_files_is_not_boilerplate(duckdb_storage):
         [diff(f"c{i}", f"f{i}.py", added(boiler)) for i in range(n)],
     )
     assert len(res.moved) == n - 1  # every file but the first
+
+
+def test_min_chars_boundary_is_inclusive_after_trimming():
+    n = dw.MOVED_MIN_CHARS
+    at, under = "x" * n, "y" * (n - 1)
+    # Padding is trimmed before counting: 25 characters inside, more outside.
+    patch = added(f"+    {at}   ", f"+    {under}   ")
+    assert dw.qualifying_fingerprints(patch) == {dw.fingerprint(at)}
 
 
 def test_fingerprints_are_deterministic_64_bit():
@@ -367,6 +444,25 @@ def test_write_rebuilds_tables_and_marks_the_run(duckdb_storage):
     marker = dw.last_run(duckdb_storage)
     assert marker["commits"] == 3 and marker["rules_version"] == dw.DEDUPE_RULES_VERSION
     assert duckdb_storage.count("dedupe_runs") == 1
+
+
+def test_a_crash_mid_write_reads_as_never_ran(duckdb_storage, monkeypatch):
+    res = run(duckdb_storage, [commit("base"), commit("feat"),
+                               commit("m", parents="base,feat")])
+    dw.write(duckdb_storage, res)
+    assert dw.last_run(duckdb_storage) is not None
+
+    real = duckdb_storage.replace_table
+
+    def crash_on_moved(table, records):
+        if table == "file_moved_share":
+            raise RuntimeError("boom")
+        real(table, records)
+
+    monkeypatch.setattr(duckdb_storage, "replace_table", crash_on_moved)
+    with pytest.raises(RuntimeError, match="boom"):
+        dw.write(duckdb_storage, res)
+    assert dw.last_run(duckdb_storage) is None  # the old marker must not survive
 
 
 def test_clean_data_still_counts_as_a_run(duckdb_storage):

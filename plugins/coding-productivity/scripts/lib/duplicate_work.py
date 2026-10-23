@@ -6,9 +6,11 @@ Five rules (see README, "Duplicate work"). Four of them exclude whole commits
 
 1. merge      a commit with >= 2 parents whose second parent is in the table
 2. squash     the squash/merge commit of a merged MR/PR whose own branch
-              commits are in the table and cover >= SQUASH_COVERAGE of its lines
+              commits (merges of the base branch excluded) are in the table and
+              cover >= SQUASH_COVERAGE of its lines
 3. promotion  the merge/squash commit of a merged MR/PR whose SOURCE branch is
-              long-lived (staging -> main, develop -> master)
+              long-lived (staging -> main, develop -> master) and some of whose
+              own commits are in the table (a fork PR from `main` has none)
 4. copy       same project, author, title and identical changed-line content
               per file as an earlier commit (cherry-pick, rebase, re-push)
 5. moved      (file level) added lines that already appeared earlier in a
@@ -317,12 +319,17 @@ def _rule_squash_and_promotion(commits, mrs, links) -> tuple[set[str], set[str]]
             c = commits.get(sha) if sha else None
             if c is None:
                 continue
-            if is_long_lived(mr.source_branch):
+            # The PR's own stored commits. Promotion needs only that some of the
+            # work is stored elsewhere (a fork PR from `main` has none, so its
+            # squash commit is the only copy); squash coverage counts real
+            # commits only, not merges of the base branch into the PR.
+            branch = [commits[s] for s in own if s != sha and s in commits]
+            if is_long_lived(mr.source_branch) and branch:
                 promotion.add(sha)
             if len(c.parents) != 1 or c.lines <= 0:
                 continue
-            branch = [commits[s] for s in own if s != sha and s in commits]
-            if branch and sum(b.lines for b in branch) >= SQUASH_COVERAGE * c.lines:
+            real = [b for b in branch if len(b.parents) < 2]
+            if real and sum(b.lines for b in real) >= SQUASH_COVERAGE * c.lines:
                 squash.add(sha)
     return squash, promotion
 
