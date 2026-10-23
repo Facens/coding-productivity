@@ -721,7 +721,7 @@ def author_productivity(storage: Storage, config: Config,
         if r["author_email"] is None:
             continue
         acc = merged.setdefault(people.key(r["author_email"]), {
-            "best": (-1, "", ""), "commits": 0, "total": 0.0,
+            "best": (-1, "", ""), "commits": 0, "total": 0,
             "score_sum": 0.0, "score_count": 0, "cats": {}})
         acc["best"] = max(acc["best"], (r["commits"], r["author_name"] or "",
                                         r["author_email"]),
