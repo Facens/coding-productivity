@@ -125,6 +125,16 @@ A developer count that depends on how many addresses someone commits from is wro
 
 `MIN_ACTIVE_COMMITS` (default 1) is the number of commits a person needs in a month to count as an active developer. At the default nothing changes. Above 1, monthly trends gain two columns, `active_developers` and `productivity_per_active_developer` (the productivity of those developers divided by their number; lines changed when nothing is scored). `unique_authors` stays as it was, so both views are visible. The columns appear only above 1 so the default output and every existing number stay as they were.
 
+### Commit date
+
+`DATE_FIELD` chooses the date that puts a commit in a month and inside `--since` / `--until`: `committed_date` (default) or `authored_date`. A commit written in January and rebased or cherry-picked in February belongs to February by commit date, so the month is when the change reached the branch. Authored date follows the author's clock and can land far from the merge. The same field is used for monthly trends, period comparison, the author table, categories, code efficiency and the single-model check. Merge velocity buckets by the MR's `created_at`. A commit with no stored `committed_date` is bucketed by its authored date, so nothing drops out.
+
+The default changed in 0.16.0 (it was the authored date). For repos with rebases and cherry-picks, monthly numbers move by a few percent; set `DATE_FIELD=authored_date` to reproduce older figures.
+
+### Importing an alias table
+
+If an earlier pipeline kept a table of aliases, load it instead of retyping it: `python3.14 scripts/import_aliases.py --config .coding-productivity.env --csv aliases.csv` (or `/coding-productivity:developers`, "Import aliases"). The CSV has the header `original_email,canonical_email`. Each pair is added to `IDENTITY_MERGES` (lowercased; existing entries stay). Pairs whose two addresses are equal are skipped. A pair is refused when a value is empty or contains `,` or `:` (either would corrupt the comma-separated setting) or when the alias is already merged into a different address; refused lines are listed by line number and the exit code is 1, the valid pairs are written anyway. `--dry-run` shows the counts first. Stored data is not rewritten; `analyze` applies the merges when it counts developers.
+
 ### Repo coverage
 
 With an explicit `REPOS` list, `extract` makes one listing call per GitHub organization (the owners in `REPOS`) or GitLab group (the group that directly holds each configured project, subgroups included) and warns about active, non-archived repos that are not in `REPOS`, and about configured repos that are now archived. It only warns: what is extracted does not change. Not run with `--repo` / `--project`.
@@ -132,6 +142,8 @@ With an explicit `REPOS` list, `extract` makes one listing call per GitHub organ
 ### Anonymization
 
 Developer identities are HMAC-SHA256 hashed by default. The pseudonymization key is stored in your config file — **back it up**. Losing the key means existing hashes become permanently unresolvable.
+
+`PSEUDONYMIZATION_KEY_FORMAT` says how the key string becomes the HMAC key: `text` (default) uses the UTF-8 bytes of the string as written, `hex` decodes it with `bytes.fromhex` (a 64-character hex key becomes 32 raw bytes). The same 64 characters give two different keys, so hashes only match data produced with the same format. Use `hex` when you load data hashed by another pipeline that decoded a hex key, otherwise leave it alone: changing it on a dataset that already holds hashes breaks every lookup, like changing the key. An invalid hex key is reported by `validate` and stops extraction and analysis with an error that does not print the key.
 
 A local reverse mapping file (`.coding-productivity/developer_mapping.json`) allows the plugin to display human-readable names in the developer roster while keeping stored data anonymized. This file is PII and is never committed to version control.
 

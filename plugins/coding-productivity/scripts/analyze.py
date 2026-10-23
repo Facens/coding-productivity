@@ -2,7 +2,7 @@
 """
 Analysis engine for the coding-productivity plugin.
 
-Runs DuckDB-compatible SQL queries against the shared storage abstraction
+Runs SQL queries (DuckDB or BigQuery, see lib/dialect.py) against the shared storage abstraction
 to produce productivity metrics: monthly trends, period comparisons,
 per-author stats, merge velocity, category distribution, and code efficiency.
 
@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dataclasses import dataclass, field
 
+from lib import dialect
 from lib import duplicate_work as dw
 from lib import identity
 from lib import scoring_meta
@@ -69,6 +70,18 @@ def _excluded_devs_filter(config: Config) -> tuple[str, dict]:
     clause = f"(c.author_email IS NULL OR c.author_email NOT IN ({placeholders}))"
     params = {f"excl_{i}": e for i, e in enumerate(excluded)}
     return clause, params
+
+
+def _date_col(config) -> str:
+    """SQL expression for the date a commit is bucketed and filtered by.
+
+    ``DATE_FIELD`` selects ``committed_date`` (default) or ``authored_date``.
+    A commit with no ``committed_date`` (stores written before the column was
+    filled) falls back to its authored date instead of dropping out.
+    """
+    if (getattr(config, "DATE_FIELD", None) or "committed_date") == "authored_date":
+        return "c.authored_date"
+    return "COALESCE(c.committed_date, c.authored_date)"
 
 
 # ── Identity: who counts as one developer ───────────────────────────────────
@@ -141,15 +154,16 @@ def identity_notes(storage: Storage, config: Config,
 
 def _build_where(config: Config, since: str, until: str,
                  extra_clauses: list[str] | None = None,
-                 date_col: str = "c.authored_date") -> tuple[str, dict]:
+                 date_col: Optional[str] = None) -> tuple[str, dict]:
     """Combine repo, exclusion, and date filters into a single WHERE clause."""
+    date_col = date_col or _date_col(config)
     clauses: list[str] = []
     params: dict = {}
 
-    clauses.append(f"{date_col} >= $since")
+    clauses.append(f"{date_col} >= {dialect.timestamp_param('$since')}")
     params["since"] = since
 
-    clauses.append(f"{date_col} < $until")
+    clauses.append(f"{date_col} < {dialect.timestamp_param('$until')}")
     params["until"] = until
 
     repo_clause, repo_params = _repo_filter(config)
@@ -369,8 +383,10 @@ def check_single_scorer_model(storage: Storage, config: Config,
     """
     table = _commit_scores_table(storage)
 
+    date_col = _date_col(config)
     range_sql = " OR ".join(
-        f"(c.authored_date >= $since_{i} AND c.authored_date < $until_{i})"
+        f"({date_col} >= {dialect.timestamp_param(f'$since_{i}')} "
+        f"AND {date_col} < {dialect.timestamp_param(f'$until_{i}')})"
         for i in range(len(ranges))
     )
     params: dict = {}
@@ -441,24 +457,25 @@ def check_single_scorer_model(storage: Storage, config: Config,
 
 # ── Query functions ──────────────────────────────────────────────────────────
 
-def _monthly_people(storage: Storage, where: str, params: dict, src: _Source,
-                    scored: bool) -> list[dict]:
+def _monthly_people(storage: Storage, config: Config, where: str, params: dict,
+                    src: _Source, scored: bool) -> list[dict]:
     """Per month and stored author email: commits and productivity (or lines)."""
     if scored:
         value = "COALESCE(SUM(s.total_productivity), 0)"
         join = f"LEFT JOIN {src.scores} s ON c.commit_sha = s.commit_sha"
     else:
         value, join = src.lines_sum, src.lines_join
+    month = dialect.month_trunc(storage, _date_col(config))
     return storage.query(f"""
         {_with(*src.ctes)}SELECT
-            date_trunc('month', c.authored_date) AS month,
+            {month} AS month,
             c.author_email AS author_email,
             COUNT(DISTINCT c.commit_sha) AS commits,
             {value} AS value
         FROM commits c
         {join}
         {where}
-        GROUP BY date_trunc('month', c.authored_date), c.author_email
+        GROUP BY {month}, c.author_email
         """, params)
 
 
@@ -476,11 +493,12 @@ def monthly_trends(storage: Storage, config: Config,
     scored = _has_scores(storage)
     src = _source(storage, scored)
     where, params = _build_where(config, since, until, src.excl)
+    month = dialect.month_trunc(storage, _date_col(config))
 
     if scored:
         sql = f"""
         {_with(*src.ctes)}SELECT
-            date_trunc('month', c.authored_date) AS month,
+            {month} AS month,
             COUNT(DISTINCT c.commit_sha) AS commits,
             NULL AS unique_authors,
             ROUND(COALESCE(SUM(s.total_productivity), 0), 2) AS total_productivity,
@@ -488,20 +506,20 @@ def monthly_trends(storage: Storage, config: Config,
         FROM commits c
         LEFT JOIN {src.scores} s ON c.commit_sha = s.commit_sha
         {where}
-        GROUP BY date_trunc('month', c.authored_date)
+        GROUP BY {month}
         ORDER BY month
         """
     else:
         sql = f"""
         {_with(*src.ctes)}SELECT
-            date_trunc('month', c.authored_date) AS month,
+            {month} AS month,
             COUNT(DISTINCT c.commit_sha) AS commits,
             NULL AS unique_authors,
             {src.lines_sum} AS total_lines_changed
         FROM commits c
         {src.lines_join}
         {where}
-        GROUP BY date_trunc('month', c.authored_date)
+        GROUP BY {month}
         ORDER BY month
         """
 
@@ -509,7 +527,7 @@ def monthly_trends(storage: Storage, config: Config,
     rows = storage.query(sql, params)
 
     months: dict = {}
-    for r in _monthly_people(storage, where, params, src, scored):
+    for r in _monthly_people(storage, config, where, params, src, scored):
         if r["author_email"] is None:
             continue
         cell = months.setdefault(r["month"], {}).setdefault(
@@ -551,6 +569,8 @@ def period_comparison(storage: Storage, config: Config,
         extra.append(excl_clause)
 
     extra_sql = (" AND " + " AND ".join(extra)) if extra else ""
+    ts = dialect.timestamp_param
+    date_col = _date_col(config)
     params = {
         "b_start": baseline_start,
         "b_end": baseline_end,
@@ -568,10 +588,10 @@ def period_comparison(storage: Storage, config: Config,
                 NULL AS unique_authors,
                 ROUND(COALESCE(SUM(s.total_productivity), 0), 2) AS total_productivity,
                 ROUND(COALESCE(AVG(s.weighted_score), 0), 3) AS avg_weighted_score,
-                COUNT(DISTINCT CAST(c.authored_date AS DATE)) AS active_days
+                COUNT(DISTINCT CAST({date_col} AS DATE)) AS active_days
             FROM commits c
             LEFT JOIN {src.scores} s ON c.commit_sha = s.commit_sha
-            WHERE c.authored_date >= $b_start AND c.authored_date < $b_end
+            WHERE {date_col} >= {ts('$b_start')} AND {date_col} < {ts('$b_end')}
                   {extra_sql}
         ),
         comparison AS (
@@ -580,10 +600,10 @@ def period_comparison(storage: Storage, config: Config,
                 NULL AS unique_authors,
                 ROUND(COALESCE(SUM(s.total_productivity), 0), 2) AS total_productivity,
                 ROUND(COALESCE(AVG(s.weighted_score), 0), 3) AS avg_weighted_score,
-                COUNT(DISTINCT CAST(c.authored_date AS DATE)) AS active_days
+                COUNT(DISTINCT CAST({date_col} AS DATE)) AS active_days
             FROM commits c
             LEFT JOIN {src.scores} s ON c.commit_sha = s.commit_sha
-            WHERE c.authored_date >= $c_start AND c.authored_date < $c_end
+            WHERE {date_col} >= {ts('$c_start')} AND {date_col} < {ts('$c_end')}
                   {extra_sql}
         )
         SELECT
@@ -605,10 +625,10 @@ def period_comparison(storage: Storage, config: Config,
                 COUNT(DISTINCT c.commit_sha) AS commits,
                 NULL AS unique_authors,
                 {src.lines_sum} AS total_lines_changed,
-                COUNT(DISTINCT CAST(c.authored_date AS DATE)) AS active_days
+                COUNT(DISTINCT CAST({date_col} AS DATE)) AS active_days
             FROM commits c
             {src.lines_join}
-            WHERE c.authored_date >= $b_start AND c.authored_date < $b_end
+            WHERE {date_col} >= {ts('$b_start')} AND {date_col} < {ts('$b_end')}
                   {extra_sql}
         ),
         comparison AS (
@@ -616,10 +636,10 @@ def period_comparison(storage: Storage, config: Config,
                 COUNT(DISTINCT c.commit_sha) AS commits,
                 NULL AS unique_authors,
                 {src.lines_sum} AS total_lines_changed,
-                COUNT(DISTINCT CAST(c.authored_date AS DATE)) AS active_days
+                COUNT(DISTINCT CAST({date_col} AS DATE)) AS active_days
             FROM commits c
             {src.lines_join}
-            WHERE c.authored_date >= $c_start AND c.authored_date < $c_end
+            WHERE {date_col} >= {ts('$c_start')} AND {date_col} < {ts('$c_end')}
                   {extra_sql}
         )
         SELECT
@@ -645,7 +665,7 @@ def period_comparison(storage: Storage, config: Config,
             start, end = ranges[row["period"]]
             emails = storage.query(f"""
                 SELECT DISTINCT c.author_email AS author_email FROM commits c
-                WHERE c.authored_date >= $start AND c.authored_date < $end
+                WHERE {date_col} >= {ts('$start')} AND {date_col} < {ts('$end')}
                       {extra_sql}""",
                 {**repo_params, **excl_params, "start": start, "end": end})
             row["unique_authors"] = len({people.key(e["author_email"])
@@ -785,7 +805,8 @@ def merge_velocity(storage: Storage, config: Config,
         mr_repo_clause = ""
     mr_excl_clause = excl_clause.replace("c.author_email", "m.author_email") if excl_clause else ""
 
-    clauses = ["m.created_at >= $since", "m.created_at < $until"]
+    clauses = [f"m.created_at >= {dialect.timestamp_param('$since')}",
+               f"m.created_at < {dialect.timestamp_param('$until')}"]
     if mr_repo_clause:
         clauses.append(mr_repo_clause)
     if mr_excl_clause:
@@ -797,35 +818,33 @@ def merge_velocity(storage: Storage, config: Config,
     params.update(repo_params)
     params.update(excl_params)
 
+    month = dialect.month_trunc(storage, "m.created_at")
+    days = dialect.days_between(storage, "m.created_at", "m.merged_at")
+    merged = dialect.count_where("m.state = 'merged'")
+    merged_in = "m.state = 'merged' AND m.merged_at IS NOT NULL AND "
+    within_7d = dialect.count_where(f"{merged_in}{days} <= 7")
+    within_30d = dialect.count_where(f"{merged_in}{days} <= 30")
     sql = f"""
     SELECT
-        date_trunc('month', m.created_at) AS month,
+        {month} AS month,
         COUNT(*) AS total_mrs,
-        COUNT(*) FILTER (WHERE m.state = 'merged') AS merged_count,
+        {merged} AS merged_count,
         ROUND(
-            COUNT(*) FILTER (WHERE m.state = 'merged') * 100.0
+            {merged} * 100.0
             / NULLIF(COUNT(*), 0), 1
         ) AS merge_rate_pct,
         ROUND(
             AVG(
                 CASE WHEN m.merged_at IS NOT NULL
-                     THEN EXTRACT(EPOCH FROM (m.merged_at - m.created_at)) / 86400.0
+                     THEN {days}
                 END
             ), 2
         ) AS avg_days_to_merge,
-        COUNT(*) FILTER (
-            WHERE m.state = 'merged'
-              AND m.merged_at IS NOT NULL
-              AND EXTRACT(EPOCH FROM (m.merged_at - m.created_at)) / 86400.0 <= 7
-        ) AS merged_within_7d,
-        COUNT(*) FILTER (
-            WHERE m.state = 'merged'
-              AND m.merged_at IS NOT NULL
-              AND EXTRACT(EPOCH FROM (m.merged_at - m.created_at)) / 86400.0 <= 30
-        ) AS merged_within_30d
+        {within_7d} AS merged_within_7d,
+        {within_30d} AS merged_within_30d
     FROM {LATEST_MRS} m
     {where_sql}
-    GROUP BY date_trunc('month', m.created_at)
+    GROUP BY {month}
     ORDER BY month
     """
 
@@ -880,7 +899,9 @@ def code_efficiency(storage: Storage, config: Config,
 
     # Duplicate commits are excluded; additions are not moved-code discounted
     # (this is a ratio of raw additions, not a productivity figure).
-    clauses = ["c.authored_date >= $since", "c.authored_date < $until"]
+    date_col = _date_col(config)
+    clauses = [f"{date_col} >= {dialect.timestamp_param('$since')}",
+               f"{date_col} < {dialect.timestamp_param('$until')}"]
     if dw.last_run(storage) is not None:
         clauses.append(_NOT_DUPLICATE)
     if repo_clause:
@@ -893,16 +914,19 @@ def code_efficiency(storage: Storage, config: Config,
     params.update(repo_params)
     params.update(excl_params)
 
+    month = dialect.month_trunc(storage, date_col)
     sql = f"""
     WITH commit_merged AS (
         SELECT DISTINCT mc.commit_sha
         FROM mr_commits mc
         JOIN {LATEST_MRS} mr
-            ON mc.mr_iid = mr.mr_iid AND mc.project_id LIKE '%' || mr.project_name
+            ON mc.mr_iid = mr.mr_iid
+               AND (mc.project_id = mr.project_id
+                    OR mc.project_id LIKE '%' || mr.project_name)
         WHERE mr.state = 'merged'
     )
     SELECT
-        date_trunc('month', c.authored_date) AS month,
+        {month} AS month,
         SUM(c.additions) AS total_additions,
         SUM(CASE WHEN cm.commit_sha IS NOT NULL THEN c.additions ELSE 0 END)
             AS merged_additions,
@@ -914,7 +938,7 @@ def code_efficiency(storage: Storage, config: Config,
     FROM commits c
     LEFT JOIN commit_merged cm ON c.commit_sha = cm.commit_sha
     {where_sql}
-    GROUP BY date_trunc('month', c.authored_date)
+    GROUP BY {month}
     ORDER BY month
     """
 

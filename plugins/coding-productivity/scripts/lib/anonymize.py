@@ -32,6 +32,38 @@ def load_key(key_hex: str) -> bytes:
     return bytes.fromhex(key_hex)
 
 
+KEY_FORMATS = ("text", "hex")
+
+
+def key_bytes(value: str, key_format: str = "text") -> bytes:
+    """The HMAC key bytes for the configured ``PSEUDONYMIZATION_KEY``.
+
+    ``text`` (the default) uses the UTF-8 bytes of the string as written, which
+    is what every plugin version has always done. ``hex`` decodes it with
+    ``bytes.fromhex``, for data hashed by a pipeline that treated a hex key as
+    raw bytes: the same 64 hex characters give a different key either way, so
+    hashes only match when the format matches the one that produced them.
+
+    Raises ``ValueError`` (without echoing the key) for an unknown format or a
+    ``hex`` key that is not valid hex.
+    """
+    fmt = (key_format or "text").strip().lower()
+    if fmt == "text":
+        return value.encode("utf-8")
+    if fmt == "hex":
+        try:
+            return bytes.fromhex(value.strip())
+        except ValueError:
+            raise ValueError(
+                "PSEUDONYMIZATION_KEY_FORMAT=hex but PSEUDONYMIZATION_KEY is not "
+                "valid hex (an even number of characters 0-9 and a-f)."
+            ) from None
+    raise ValueError(
+        f"PSEUDONYMIZATION_KEY_FORMAT must be one of {', '.join(KEY_FORMATS)}, "
+        f"got '{key_format}'."
+    )
+
+
 # ── Hashing ───────────────────────────────────────────────────────────────────
 
 def pseudonymize(value: str, key: bytes) -> str:

@@ -142,7 +142,8 @@ Ask via `AskUserQuestion`:
 > 2. Find duplicates — detect and merge duplicate identities
 > 3. Exclude developer — remove a developer from analysis
 > 4. Include developer — re-include a previously excluded developer
-> 5. Done — exit developer management
+> 5. Import aliases — load an existing alias table (CSV) into the identity merges
+> 6. Done — exit developer management
 
 ---
 
@@ -291,7 +292,6 @@ from pathlib import Path
 from scripts.lib.config import Config
 from scripts.lib.storage import Storage
 from scripts.lib.dedup import merge_identities, apply_retroactive_merges
-from scripts.lib.anonymize import load_key
 
 cfg = Config()
 st = Storage(cfg)
@@ -302,7 +302,7 @@ alias_emails = ['ALIAS_EMAIL']
 merge_identities(canonical_email, alias_emails, cfg)
 
 if cfg.ANONYMIZATION_ENABLED and cfg.PSEUDONYMIZATION_KEY:
-    key = load_key(cfg.PSEUDONYMIZATION_KEY.decode('utf-8'))
+    key = cfg.PSEUDONYMIZATION_KEY  # bytes, decoded per PSEUDONYMIZATION_KEY_FORMAT
     mapping_path = Path('.coding-productivity/developer_mapping.json')
     affected = apply_retroactive_merges(st, mapping_path, key, {'ALIAS_EMAIL': 'CANONICAL_EMAIL'})
     print(f'Retroactive merge applied: {affected} rows updated')
@@ -392,7 +392,21 @@ After the change, return to Step 2 to refresh and redisplay the roster, then sho
 
 ---
 
-### Action 5: Done
+### Action 5: Import Aliases
+
+For a user who already has a table of aliases (`original_email,canonical_email`, one pair per row) from an earlier pipeline. Ask for the CSV path, then run a dry run via Bash:
+
+```
+python3.14 scripts/import_aliases.py --config .coding-productivity.env --csv PATH_TO_CSV --dry-run
+```
+
+It reports how many pairs it would add, how many are already in `IDENTITY_MERGES` or have the same address on both sides (skipped), and which CSV lines it refuses: an empty value, a value containing `,` or `:` (they would split `IDENTITY_MERGES`, a comma-separated list of `alias:canonical` pairs), or an alias already merged into a different address (the first mapping stays). It prints line numbers, not emails. Show the counts, ask the user to confirm, then run it again without `--dry-run`. Valid pairs are always written; the exit code is 1 when any pair was refused, so tell the user to fix those rows and run it again (pairs already imported are skipped the second time).
+
+`analyze` applies `IDENTITY_MERGES` at analysis time and does not touch stored data. With anonymization on, offer Action 2's retroactive rewrite only if the user wants the stored hashes changed too. Then return to Step 2 and show the menu again.
+
+---
+
+### Action 6: Done
 
 Display a summary of changes made during this session (how many bots confirmed, identities merged, developers excluded/included). Then exit.
 

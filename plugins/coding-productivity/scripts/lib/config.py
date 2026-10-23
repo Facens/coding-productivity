@@ -199,11 +199,24 @@ class Config:
         return self._get_bool("ANONYMIZATION_ENABLED")
 
     @property
+    def PSEUDONYMIZATION_KEY_FORMAT(self) -> str:
+        """How ``PSEUDONYMIZATION_KEY`` becomes HMAC key bytes: ``text`` (UTF-8
+        bytes of the string, default) or ``hex`` (``bytes.fromhex``). Unknown
+        values are returned as typed and reported by ``validate``."""
+        val = self._get("PSEUDONYMIZATION_KEY_FORMAT")
+        return val.strip().lower() if val and val.strip() else "text"
+
+    @property
     def PSEUDONYMIZATION_KEY(self) -> bytes | None:
+        """The HMAC key as bytes, decoded per ``PSEUDONYMIZATION_KEY_FORMAT``.
+        This is the one place the key string becomes bytes, so extraction,
+        identity matching and the mapping file all hash with the same key.
+        Raises ``ValueError`` for a ``hex`` key that is not valid hex."""
         val = self._get("PSEUDONYMIZATION_KEY")
         if val is None:
             return None
-        return val.encode("utf-8")
+        from . import anonymize  # local import: keeps config import-light
+        return anonymize.key_bytes(val, self.PSEUDONYMIZATION_KEY_FORMAT)
 
     @property
     def EXCLUDED_DEVELOPERS(self) -> list[str]:
@@ -226,6 +239,14 @@ class Config:
     def IDENTITY_NO_MERGE(self) -> list[tuple[str, str]]:
         """``email1:email2`` pairs the automatic merge must never join."""
         return self._get_pairs("IDENTITY_NO_MERGE")
+
+    @property
+    def DATE_FIELD(self) -> str:
+        """Commit date that buckets and filters ``analyze``: ``committed_date``
+        (default) or ``authored_date``. Unknown values are returned as typed
+        and reported by ``validate``."""
+        val = self._get("DATE_FIELD")
+        return val.strip().lower() if val and val.strip() else "committed_date"
 
     @property
     def MIN_ACTIVE_COMMITS(self) -> int:
@@ -304,11 +325,30 @@ class Config:
             if self.SCORING_MAX_TOKENS < 1:
                 errors.append("SCORING_MAX_TOKENS must be a positive integer.")
 
-        if self.ANONYMIZATION_ENABLED and not self.PSEUDONYMIZATION_KEY:
+        from . import anonymize
+        key, key_error = None, False
+        if self.PSEUDONYMIZATION_KEY_FORMAT not in anonymize.KEY_FORMATS:
+            key_error = True
+            errors.append(
+                "PSEUDONYMIZATION_KEY_FORMAT must be text or hex, "
+                f"got '{self.PSEUDONYMIZATION_KEY_FORMAT}'."
+            )
+        else:
+            try:
+                key = self.PSEUDONYMIZATION_KEY
+            except ValueError as exc:
+                key_error = True
+                errors.append(str(exc))
+        if self.ANONYMIZATION_ENABLED and not key and not key_error:
             errors.append(
                 "PSEUDONYMIZATION_KEY is required when ANONYMIZATION_ENABLED=true."
             )
 
+        if self.DATE_FIELD not in ("committed_date", "authored_date"):
+            errors.append(
+                "DATE_FIELD must be committed_date or authored_date, "
+                f"got '{self.DATE_FIELD}'."
+            )
         if self.MIN_ACTIVE_COMMITS < 1:
             errors.append("MIN_ACTIVE_COMMITS must be a positive integer.")
         raw_no_merge = self._get("IDENTITY_NO_MERGE")
