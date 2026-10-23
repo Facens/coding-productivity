@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.16.0
+
+`analyze` now runs on the BigQuery backend, buckets months by commit date, and the pseudonymization key can be read as hex. Found by migrating two real BigQuery datasets (a GitLab and a GitHub one) from an earlier pipeline into the plugin.
+
+### Fixed
+
+- `analyze.py` sent DuckDB-only SQL, so on BigQuery `monthly_trends` failed with "A valid date part name is required but found c.authored_date" and no query ran. Every query `analyze` sends (monthly trends, period comparison, author table, merge velocity, categories, code efficiency, the identity load, the dedupe-adjusted CTEs and summary, the single-model guard) now executes on both backends, verified against the two datasets. What differed: `date_trunc('month', x)` (BigQuery: `DATETIME_TRUNC(DATETIME(x), MONTH)`, naive timestamps on both so output and JSON match), `EXTRACT(EPOCH ...)` for time to merge (BigQuery: `TIMESTAMP_DIFF`), `COUNT(*) FILTER (WHERE ...)` (now `SUM(CASE WHEN ...)`, valid on both) and string date parameters compared with TIMESTAMP columns (now cast).
+- `code_efficiency` reported 0% merged additions for every month whenever `mr_commits.project_id` and the merge request's `project_id` were the same platform id (data imported from another pipeline). The join matched only an `owner/name` slug against the short project name; it now also matches equal `project_id`. On the two datasets one of the two datasets reads 44% for June 2026 where it read 0%.
+- The `developers` skill's retroactive merge decoded `PSEUDONYMIZATION_KEY` as hex while extraction used its UTF-8 bytes, so it would have rewritten hashes with a different key than the data was hashed with. It now uses `Config.PSEUDONYMIZATION_KEY`.
+
+### Added
+
+- `scripts/lib/dialect.py`: the SQL that differs between DuckDB and BigQuery (month truncation, time between timestamps, conditional count, timestamp parameters) in one place, and `Storage.dialect` (`"duckdb"` / `"bigquery"`). New queries go through it.
+- Config `DATE_FIELD`: `committed_date` (default) or `authored_date`. It buckets commits into months and applies `--since` / `--until` in every `analyze` query that works on commits (monthly trends, period comparison with its active days, author table, categories, code efficiency, dedupe summary, single-model guard, people counts). A commit with no `committed_date` falls back to its authored date. `validate` rejects other values. Merge velocity still buckets by the MR's `created_at`. The identity load reads the whole dataset, as before.
+- Config `PSEUDONYMIZATION_KEY_FORMAT`: `text` (default, the UTF-8 bytes of the key string, as in every earlier version) or `hex` (`bytes.fromhex`). For data hashed by a pipeline that hex-decoded its key: the same 64 characters give two different keys, so hashes never matched. `Config.PSEUDONYMIZATION_KEY` is the single place the string becomes bytes, so extraction hashing, generic-name hashes, `IDENTITY_MERGES` / `IDENTITY_NO_MERGE` pseudonym matching and the mapping file follow it. Invalid hex fails with an error that does not print the key; `validate` reports it.
+- `scripts/import_aliases.py` and a `developers` skill action, "Import aliases": loads a CSV of `original_email,canonical_email` into `IDENTITY_MERGES`. Equal pairs are skipped; values that are empty, contain `,` or `:`, or map an alias that is already merged elsewhere are refused and listed by CSV line number. Valid pairs are written; exit code 1 if any was refused; `--dry-run`.
+
+### Upgrade notes
+
+- **The month a commit belongs to can change.** `DATE_FIELD` defaults to `committed_date`; earlier versions bucketed by `authored_date`. For repos with rebases and cherry-picks, monthly totals move by a few percent per month (a commit authored on the 30th and rebased on the 2nd moves to the next month). Set `DATE_FIELD=authored_date` to reproduce figures published before 0.16.0, and say which field a report used. `validate` references produced before 0.16.0 can differ for the same reason.
+- `PSEUDONYMIZATION_KEY_FORMAT` defaults to `text`, so existing installs hash exactly as before. Set `hex` only for data hashed from a hex-decoded key, and never change it on a dataset that already holds hashes made with the other format.
+- No change to the lines definition (productivity = score x max(additions, 1)) or the scoring prompt.
+
 ## 0.15.0
 
 Identity resolution at analysis time, a threshold for "active" developers, a repo coverage check and a README "Limits" section. On a real dataset (pseudonymized) 47 developers were counted where the true number was 44: two people committed from two emails each, and a non-person account called "Root" was counted. Until now only the interactive `developers` skill merged identities, so `run` and `analyze` never fixed this.
