@@ -95,9 +95,6 @@ class People:
         person = self.by_email.get(email)
         return person.key if person else email
 
-    def person(self, email: Optional[str]) -> Optional[Person]:
-        return self.by_email.get(email) if email is not None else None
-
     def non_person_emails(self) -> list[str]:
         """Stored emails of non-person accounts, to exclude from queries."""
         return sorted(e for p in self.persons if p.non_person for e in p.emails)
@@ -249,16 +246,18 @@ def format_report(people: People, *, anonymized: bool = False,
             lines.append(f"  {i}. " + "; ".join(_describe(x) for x in person.identities))
         if len(merged) > limit:
             lines.append(f"  ... and {len(merged) - limit} more")
+        # Emails differing only by case are one node: pair two that really differ.
         first = merged[0].emails
+        other = next(e for e in first if e.lower() != first[0].lower())
         lines.append(
             "  A wrong merge? Add the two emails to IDENTITY_NO_MERGE, e.g. "
-            f"IDENTITY_NO_MERGE={first[0]}:{first[1]} "
+            f"IDENTITY_NO_MERGE={first[0]}:{other} "
             "(IDENTITY_AUTO_MERGE=false switches automatic merging off)."
         )
         if anonymized:
             lines.append(
-                "  (values are pseudonyms as stored; the pair can be given as "
-                "pseudonyms or as the real emails)"
+                "  (anonymization is on, so these are pseudonyms; to check a merge "
+                "run /coding-productivity:developers, which resolves them locally)"
             )
     excluded = people.non_persons()
     if excluded:
