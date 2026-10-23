@@ -43,6 +43,9 @@ _NAMED_PARAM = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
 class Storage(abc.ABC):
     """Minimal contract every storage backend must satisfy."""
 
+    # SQL dialect the backend speaks ("duckdb" or "bigquery"); see lib/dialect.py.
+    dialect: str = "duckdb"
+
     @abc.abstractmethod
     def create_tables(self) -> None: ...
 
@@ -97,6 +100,8 @@ class Storage(abc.ABC):
 
 class DuckDBStorage(Storage):
     """Local DuckDB storage with file-level locking for writes."""
+
+    dialect = "duckdb"  # read by lib/dialect.py
 
     def __init__(self, db_path: str, *, readonly: bool = False):
         import duckdb
@@ -255,6 +260,8 @@ class BigQueryStorage(Storage):
 
         pip install google-cloud-bigquery
     """
+
+    dialect = "bigquery"  # read by lib/dialect.py
 
     _CHUNK_SIZE = 1000  # streaming-insert batch size
 

@@ -15,7 +15,7 @@ import pytest
 import analyze
 import rebase
 import score_commits
-from lib import scoring, scoring_meta, storage as storage_mod
+from lib import duplicate_work as dw, scoring, scoring_meta, storage as storage_mod
 from lib.config import Config
 from .helpers import FakeClient, make_response
 from .test_rebase import rebase_env  # noqa: F401  (fixture reused below)
@@ -130,6 +130,66 @@ def test_every_parameterised_query_path_works_on_bigquery(bq):
                                                 ("2026-03-01", "2026-04-01")])
     sql = bq._client.queries[-1][0]
     assert "@since_1" in sql and "@repo_0" in sql and "@excl_0" in sql
+
+
+class ScriptedBQClient(StrictBQClient):
+    """Answers the few lookups analyze makes before its main queries, with
+    scores and a dedupe run present so every code path (the dedupe CTEs
+    included) is built; every other query returns no rows."""
+
+    def query(self, sql, job_config=None):
+        super().query(sql, job_config)
+        rows = []
+        if "FROM dedupe_runs" in sql:
+            rows = [{"rules_version": dw.DEDUPE_RULES_VERSION, "run_at": None,
+                     "commits": 1, "merged_mrs": 0, "merged_mrs_with_sha": 0}]
+        elif "AS cnt FROM" in sql:
+            rows = [{"cnt": 5}]
+        elif "COUNT(DISTINCT commit_sha) AS n FROM commits" in sql:
+            rows = [{"n": 1}]
+        elif "GROUP BY c.author_name, c.author_email" in sql and "WITH" not in sql:
+            rows = [{"author_name": "a", "author_email": "a@x", "commits": 1}]
+        return NS(result=lambda page_size=None: iter(rows))
+
+
+# What DuckDB accepts and BigQuery rejects. The first run on a real BigQuery
+# dataset died on date_trunc('month', <timestamp>); these cover its siblings.
+DUCKDB_ONLY_SQL = ["date_trunc(", "FILTER (", "FILTER(", "EXTRACT(EPOCH", "::",
+                   "ILIKE", "$"]
+
+
+@pytest.mark.parametrize("scored_and_deduped", [True, False])
+def test_every_analyze_query_is_bigquery_sql(bq, scored_and_deduped):
+    # Unscored and never deduped, or scored with a dedupe run (the CTE path).
+    bq._client = ScriptedBQClient() if scored_and_deduped else StrictBQClient()
+    cfg = NS(REPOS=["org/repo"], EXCLUDED_DEVELOPERS=["bot@x"], DATE_FIELD="committed_date")
+    since, until = "2026-01-01", "2026-02-01"
+    people = analyze.load_people(bq, cfg)
+    analyze.monthly_trends(bq, cfg, since, until, people=people)
+    analyze.period_comparison(bq, cfg, since, until, "2026-02-01", "2026-03-01", people=people)
+    analyze.author_productivity(bq, cfg, since, until, people=people)
+    analyze.merge_velocity(bq, cfg, since, until, people=people)
+    analyze.category_distribution(bq, cfg, since, until, people=people)
+    analyze.code_efficiency(bq, cfg, since, until, people=people)
+    analyze.dedupe_summary(bq, cfg, since, until)
+    analyze.check_dedupe(bq)
+    analyze.check_single_scorer_model(bq, cfg, [(since, until), ("2026-03-01", "2026-04-01")])
+
+    queries = [q[0] for q in bq._client.queries]
+    assert len(queries) > 20
+    for sql in queries:
+        for bad in DUCKDB_ONLY_SQL:
+            assert bad not in sql, f"{bad!r} is not BigQuery SQL:\n{sql}"
+    joined = "\n".join(queries)
+    # Month bucketing goes through DATETIME_TRUNC, dates are compared as TIMESTAMPs,
+    # and merge velocity measures time with TIMESTAMP_DIFF and counts with CASE.
+    assert "DATETIME_TRUNC(DATETIME(COALESCE(c.committed_date, c.authored_date)), MONTH)" in joined
+    assert "DATETIME_TRUNC(DATETIME(m.created_at), MONTH)" in joined
+    assert "CAST(@since AS TIMESTAMP)" in joined and "CAST(@since_1 AS TIMESTAMP)" in joined
+    assert "CAST(@b_start AS TIMESTAMP)" in joined
+    assert "TIMESTAMP_DIFF(m.merged_at, m.created_at, MICROSECOND)" in joined
+    if scored_and_deduped:
+        assert "dd_files AS" in joined  # the dedupe-adjusted CTEs ran too
 
 
 # ── 2. get_active: only "table missing" means legacy ─────────────────────────
