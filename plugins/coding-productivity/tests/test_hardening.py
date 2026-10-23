@@ -123,8 +123,7 @@ def test_bigquery_leaves_unbound_dollar_alone_and_runs_without_params(bq):
 def test_every_parameterised_query_path_works_on_bigquery(bq):
     """Each call site that binds $params must survive a $-rejecting backend."""
     score_commits._fetch_diffs_for_commit(bq, "abc")
-    rebase._commit(bq, "abc")
-    rebase._diffs(bq, "abc")
+    rebase._prefetch(bq, ["abc", "def"])
     cfg = NS(REPOS=["org/repo"], EXCLUDED_DEVELOPERS=["bot@x"])
     analyze.check_single_scorer_model(bq, cfg, [("2026-01-01", "2026-02-01"),
                                                 ("2026-03-01", "2026-04-01")])

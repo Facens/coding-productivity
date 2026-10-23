@@ -56,3 +56,14 @@ def count_where(condition: str) -> str:
     """Rows matching *condition*: ``COUNT(*) FILTER (WHERE ...)`` is DuckDB
     only, ``COUNTIF`` is BigQuery only; the ``CASE`` form is both."""
     return f"SUM(CASE WHEN {condition} THEN 1 ELSE 0 END)"
+
+
+def in_list_param(storage, column: str, placeholder: str) -> str:
+    """``column`` is one of the values of list parameter *placeholder*.
+
+    BigQuery binds a Python list as an ARRAY parameter (``IN UNNEST(@p)``);
+    DuckDB binds it as a LIST (``= ANY($p)``).
+    """
+    if of(storage) == BIGQUERY:
+        return f"{column} IN UNNEST({placeholder})"
+    return f"{column} = ANY({placeholder})"
