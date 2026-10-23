@@ -46,7 +46,7 @@ Duplicate work (merge, squash, promotion and copied commits, moved code) is excl
 Ask the user:
 > What analysis would you like to run?
 >
-> 1. Monthly Trends -- commit count, productivity, avg score, unique authors by month
+> 1. Monthly Trends -- commit count, productivity, avg score, developers by month
 > 2. Period Comparison -- before/after metrics with % change (e.g. pre/post AI adoption)
 > 3. Author Productivity -- per-author: commits, total productivity, avg score, top category
 > 4. Merge Velocity -- monthly: MRs, merge rate, avg time to merge, velocity at 7d/30d
@@ -97,6 +97,10 @@ python3.14 scripts/analyze.py --config .coding-productivity.env \
 ## Step 5: Display Results
 
 Present the script output directly. It is already formatted as markdown tables. Keep the `excluded: N commits (...), moved-code discount X% of productivity` line that precedes them: it says how much duplicate work was removed from the selected range.
+
+Keep the `identity:` lines too. They list the identities `analyze` joined into one person (stored names and emails, with commit counts) and the non-person accounts (such as `root`) it left out, so a reader can review them. With anonymization on the lines show pseudonyms, not names: to check a merge, use `/coding-productivity:developers`, which resolves pseudonyms locally. To undo one, add its two emails to `IDENTITY_NO_MERGE` in `.coding-productivity.env` (`email1:email2`), or set `IDENTITY_AUTO_MERGE=false`; `/coding-productivity:developers` records the pair for the user. Developer counts (`unique_authors`) count people, not emails.
+
+Developers who commit once a month still count as developers. When the user wants to see the effect, set `MIN_ACTIVE_COMMITS=N` in `.coding-productivity.env`: monthly trends then gain `active_developers` (people with at least N commits in the month) and `productivity_per_active_developer` (their productivity divided by their number). The default, 1, adds nothing.
 
 If the script exits with a message that the date range mixes scoring models (or mixes legacy scores with a recorded model), do not work around it. Explain that a trend across two models is a trend in the instrument, and offer:
 

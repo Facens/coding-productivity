@@ -218,6 +218,8 @@ After review is complete, return to Step 2 to refresh and redisplay the roster, 
 
 ### Action 2: Find Duplicates
 
+`analyze.py` already joins identities on its own (`IDENTITY_AUTO_MERGE`, on by default): two emails used with one author name, or one email used with two names, count as one person in every developer count and table, without touching stored data. This action covers the rest (same email local-part, normalized names) and the permanent, retroactive merge. Tell the user that `analyze` prints the automatic merges it applied, and that a wrong one is undone by answering "different people" below, which records the pair in `IDENTITY_NO_MERGE`.
+
 Run duplicate detection via Bash:
 
 ```
@@ -309,6 +311,22 @@ else:
 "
 ```
 
+For each pair the user answers "No, these are different people", append it to `IDENTITY_NO_MERGE` (comma-separated `email1:email2` pairs, real emails, not hashes) so the automatic merge never joins them:
+
+```
+python3.14 -c "
+from scripts.lib.config import Config
+
+cfg = Config()
+pairs = [f'{a}:{b}' for a, b in cfg.IDENTITY_NO_MERGE]
+pair = 'EMAIL_A:EMAIL_B'
+if pair not in pairs:
+    pairs.append(pair)
+cfg.update('IDENTITY_NO_MERGE', ','.join(pairs))
+print('Recorded: analyze will not join these two emails.')
+"
+```
+
 After all pairs are reviewed, return to Step 2 to refresh and redisplay the roster, then show the action menu again.
 
 ---
@@ -384,6 +402,8 @@ All changes are persisted to `.coding-productivity.env` via `config.update()`. T
 
 - `BOT_OVERRIDES` — comma-separated list of confirmed bot names
 - `IDENTITY_MERGES` — comma-separated `alias:canonical` email pairs
+- `IDENTITY_NO_MERGE` — comma-separated `email1:email2` pairs the automatic merge must never join
+- `IDENTITY_AUTO_MERGE` — `true` (default) or `false`; set by hand, switches the automatic merge in `analyze` off
 - `EXCLUDED_DEVELOPERS` — comma-separated list of excluded developer emails
 
 No manual file editing is needed. The `config.update()` method handles atomic writes.

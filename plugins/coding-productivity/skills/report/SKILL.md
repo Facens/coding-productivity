@@ -119,6 +119,8 @@ If a score-based query exits with an error that the date range mixes scoring mod
 
 Every analysis run prints, on stderr when the format is json, an `excluded: N commits (...), moved-code discount X% of productivity` line for its range, and a WARNING when duplicate-work detection has never run or is out of date. Offer to run `/coding-productivity:dedupe` first when it warns, and state in the report how much duplicate work was excluded (or that none was, because dedupe has not run), so readers know the totals are net of it.
 
+Every run also prints `identity:` lines (stderr when the format is json): the identities joined into one person automatically, and the non-person accounts excluded. Say in the report how many people were merged this way and that `IDENTITY_NO_MERGE` undoes a wrong merge. When `MIN_ACTIVE_COMMITS` is above 1, monthly trends carry `active_developers` and `productivity_per_active_developer`; show both next to `unique_authors` and say which threshold was used.
+
 When scoring data is included, state in the report which `scorer_model` produced the scores (shown by the `score` skill summary or the `scoring_meta` table) so readers know the instrument.
 
 ## Step 5: Compose the Report

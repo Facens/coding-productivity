@@ -163,14 +163,16 @@ class GitHubClient:
 
     # ── Public methods ────────────────────────────────────────────────────
 
-    def list_repos(self, org: str) -> list[dict]:
-        """Return all non-archived repositories for *org*."""
+    def list_repos(self, org: str, include_archived: bool = False) -> list[dict]:
+        """Return the repositories of *org*: the non-archived ones, or all of
+        them (each with an ``archived`` flag) when *include_archived* is set."""
         print(f"Fetching repos for org {org}...", flush=True)
         repos = []
         for repo in self._paginate(f"/orgs/{org}/repos", {"type": "all", "sort": "updated"}):
-            if repo.get("archived"):
+            if repo.get("archived") and not include_archived:
                 continue
             repos.append({
+                "archived": bool(repo.get("archived")),
                 "id": repo["id"],
                 "name": repo["name"],
                 "full_name": repo["full_name"],

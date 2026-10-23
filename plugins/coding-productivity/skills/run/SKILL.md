@@ -56,6 +56,8 @@ If the venv doesn't exist, run `python3 {scripts_dir}/setup_env.py` first.
 
 Show extraction progress to the user.
 
+With an explicit `REPOS`, the extract scripts print `Warning:` lines about active repos in the same org or group that are not in `REPOS`, and about configured repos that are archived. Relay them. They only warn: what was extracted does not change. Offer `/coding-productivity:setup` to update `REPOS`.
+
 ## Step 4: Score (if enabled)
 
 If `SCORING_ENABLED=true` in config:
@@ -94,6 +96,8 @@ Run all analysis queries:
 
 Display all results to the user as markdown tables, with the `excluded: ...` line the script prints for the range.
 
+Keep the `identity:` lines too. They list the identities `analyze` joined into one person (stored names and emails, with commit counts) and the non-person accounts (such as `root`) it left out, so a reader can review them. With anonymization on the lines show pseudonyms, not names: to check a merge, use `/coding-productivity:developers`, which resolves pseudonyms locally. To undo one, add its two emails to `IDENTITY_NO_MERGE` in `.coding-productivity.env` (`email1:email2`), or set `IDENTITY_AUTO_MERGE=false`. Developer counts (`unique_authors`) count people, not emails.
+
 If an analysis exits with an error that the date range mixes scoring models, stop and explain it (a trend across two models is a trend in the instrument). Offer a narrower range, or `/coding-productivity:calibrate` then `/coding-productivity:rebase`.
 
 ## Step 7: Summary
@@ -106,6 +110,7 @@ Pipeline complete for {date_range}.
 Extraction:  {commit_count} commits from {repo_count} repos
 Scoring:     {scored_count} commits scored (or "Skipped -- not enabled")
 Duplicates:  {excluded_count} commits excluded, {moved_files} files with moved code
+Identities:  {merged_count} merged
 Analysis:    4 reports generated
 
 Next steps:

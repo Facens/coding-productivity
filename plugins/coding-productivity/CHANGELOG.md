@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.15.0
+
+Identity resolution at analysis time, a threshold for "active" developers, a repo coverage check and a README "Limits" section. On a real dataset (pseudonymized) 47 developers were counted where the true number was 44: two people committed from two emails each, and a non-person account called "Root" was counted. Until now only the interactive `developers` skill merged identities, so `run` and `analyze` never fixed this.
+
+### Added
+
+- `scripts/lib/identity.py`: `analyze` resolves stored `(author_name, author_email)` pairs into people. Two emails used with one author name are one person, and one email used with two names is one person (union-find over stored values, so it works on pseudonymized data). Generic names (`GENERIC_NAMES` in `lib/dedup.py`) never link anything; with anonymization on, the hashed form of each generic name is compared too. `IDENTITY_MERGES` is applied first.
+- Config `IDENTITY_AUTO_MERGE` (default `true`; `false` leaves only `IDENTITY_MERGES`), `IDENTITY_NO_MERGE` (`email1:email2` pairs never joined; real emails or the stored values) and `MIN_ACTIVE_COMMITS` (default 1). `validate` rejects `MIN_ACTIVE_COMMITS` below 1 and malformed `IDENTITY_NO_MERGE`.
+- `analyze` prints `identity:` lines: the automatic merges it applied (stored names and emails, commit counts) and the non-person accounts it excluded, with the `IDENTITY_NO_MERGE` line that undoes a merge. They go to stderr for json and csv output.
+- `MIN_ACTIVE_COMMITS` above 1 adds `active_developers` and `productivity_per_active_developer` (`lines_per_active_developer` when nothing is scored) to monthly trends: people with at least that many commits in the month, and their productivity per person. The columns appear only above 1, so default output is unchanged.
+- `lib/coverage.py`: with an explicit `REPOS`, `extract_github.py` and `extract_gitlab.py` list the org (GitHub owners in `REPOS`) or group (the group that directly holds each configured project, subgroups included) once and warn about active repos not in `REPOS` and configured repos that are archived. Warning only; extraction is unchanged and `--repo` / `--project` skip it. `GitHubClient.list_repos(org, include_archived=False)` and the GitLab project listing and resolution now carry an `archived` flag.
+- README "Limits" section (deleted lines score zero, low weight of config, docs and translations with the real caps, productivity = score x lines, anyone with a commit counts, identity matching, merge flows comparable since 0.14.0), and sections on developer identities and repo coverage.
+
+### Changed
+
+- Non-person accounts (every stored name generic, such as `root`) are removed from every `analyze` query through the excluded-developers filter, commits and productivity included, as bots are. Bots were already dropped at extraction; this covers what is already stored. A person who has used a generic name on an email that also carries a real name is not excluded.
+- `unique_authors` (monthly trends, period comparison) counts people, not emails. The author table has one row per person, under its most-used stored name and email, and is sorted and limited by person. Identities are resolved over the whole dataset (REPOS and `EXCLUDED_DEVELOPERS` applied, dates not), so one person keeps one identity across periods.
+- With anonymization on, the merge report shows pseudonyms, not names, and says so; `/coding-productivity:developers` resolves them locally. `run` now relays the repo coverage warnings and the `identity:` lines, and its summary shows the number of merged identities.
+- `period_comparison` keys the per-period people counts by the period label, not by row position, so the result no longer depends on the order the database returns the two rows. The SQL `unique_authors` columns are `NULL` placeholders filled per person afterwards.
+- The `IDENTITY_NO_MERGE` example in the report pairs two emails that differ by more than case.
+- The excluded-developers clause is NULL-safe: commits with no author email are no longer dropped whenever `EXCLUDED_DEVELOPERS` is set.
+
+### Upgrade notes
+
+- Developer counts and the author table can go down after upgrading. That is the fix, not a regression; re-read published figures. Set `IDENTITY_AUTO_MERGE=false` to get only explicit merges and the non-person exclusion.
+- Two different people who share an author name are merged until you list their emails in `IDENTITY_NO_MERGE`. The same goes for a shared non-generic email (team mailbox, CI address).
+- `validate` references produced before 0.15.0 counted emails in `unique_authors`; it now counts people. Regenerate the reference, or set `IDENTITY_AUTO_MERGE=false` to compare.
+- New datasets still store accounts such as `root`; they are excluded at analysis time.
+
 ## 0.14.0
 
 Duplicate-work detection. On real data (a GitLab org and a GitHub org, all branches) the same work was counted several times and the duplicate share grew over time, inflating trends: a board-level "+70%" became "+60%" once duplicates were removed. Five rules, validated by hand on that data, now find them.

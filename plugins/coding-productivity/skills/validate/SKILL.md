@@ -97,7 +97,7 @@ If there are any FAIL results, walk the user through possible causes:
 2. **Storage backend differences** -- DuckDB and BigQuery may produce slightly different floating-point rounding. If migrating between backends, increase `--tolerance` (e.g., `0.05`) to account for this.
 3. **DuckDB vs BigQuery rounding** -- DuckDB uses IEEE 754 double precision; BigQuery uses FLOAT64 with different rounding for `ROUND()` at boundary values. Scores at exactly N.5 may round differently.
 4. **Data changes** -- if new commits were extracted between generating the reference and running validation, counts will differ. Re-generate the reference after extraction to get a fresh baseline.
-5. **Configuration changes** -- if `REPOS`, `EXCLUDED_DEVELOPERS`, or `IDENTITY_MERGES` changed, the filtered dataset is different. Ensure the same config was active for both the reference and the validation.
+5. **Configuration changes** -- if `REPOS`, `EXCLUDED_DEVELOPERS`, `IDENTITY_MERGES`, `IDENTITY_AUTO_MERGE` or `IDENTITY_NO_MERGE` changed, the filtered dataset or the developer count is different. Ensure the same config was active for both the reference and the validation. References produced before 0.15.0 counted emails in `unique_authors`; it now counts people. Regenerate the reference, or set `IDENTITY_AUTO_MERGE=false` to compare.
 
 Ask the user:
 > Would you like to:

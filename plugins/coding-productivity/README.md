@@ -46,7 +46,7 @@ Or run each step individually:
 - **GitHub + GitLab** — Supports both platforms, including self-hosted GitLab.
 - **AI scoring (optional)** — a Claude model you choose (`SCORING_MODEL`) evaluates each commit's intellectual value (0.0-1.0). Every score records the model and prompt that produced it.
 - **Duplicate-work detection** — merge, squash, promotion and copied commits are excluded and moved code is discounted, so totals and trends count each piece of work once.
-- **Identity management** — Bot detection, duplicate identity merging, developer exclusions.
+- **Identity management** — Bot detection, automatic merging of identities that share a name or an email, duplicate identity merging, developer exclusions.
 - **Anonymization** — HMAC-SHA256 hashing of developer identities, on by default.
 - **Incremental by default** — Re-runs fetch only new commits since the last extraction. Use `--full` to force a complete re-extraction.
 - **Resumable** — Extraction checkpoints, rate-limit handling with pause/resume.
@@ -111,6 +111,24 @@ Rules 2 and 3 need the merge or squash commit of each merged MR/PR, which `extra
 
 The constants (80% coverage, 25 characters, 20 files, 0.5 share, branch pattern) and `DEDUPE_RULES_VERSION` live in `scripts/lib/duplicate_work.py`. The version is recorded in both result tables; change any constant and bump it.
 
+### Developer identities
+
+A developer count that depends on how many addresses someone commits from is wrong. On one real dataset two people committed from two emails each and a non-person account called "Root" was counted: 47 developers where the true number was 44. `analyze` now resolves identities itself, on every run, without touching stored data:
+
+- Two emails used with the same author name are one person, and one email used with two names is one person (a union over the stored names and emails, case-insensitive). It works on anonymized data, because the same name always hashes to the same value.
+- Generic names (`admin`, `root`, `system`, `ci`, `bot`, `noreply`, `unknown`... see `GENERIC_NAMES` in `scripts/lib/dedup.py`) never link anything, raw or hashed.
+- An account whose every name is generic is not a person. It is left out of every count and total, as bots are (bots are dropped at extraction; this covers what is already stored).
+- `IDENTITY_MERGES` (`alias:canonical` emails) is applied first. `IDENTITY_AUTO_MERGE=false` switches the automatic step off, `IDENTITY_NO_MERGE=email1:email2,...` lists pairs that must never be joined.
+- Identities are resolved over the whole dataset (REPOS and `EXCLUDED_DEVELOPERS` applied, dates not), so one person keeps one identity across the baseline and the comparison period.
+
+`unique_authors` in monthly trends and period comparison, and the per-author table, count and group people. The author table shows each person under their most-used stored name and email. `analyze` prints the automatic merges it applied (stored names and emails, with commit counts) and the accounts it excluded, so you can review them. With anonymization on the report shows pseudonyms, not names, so a wrong merge is not readable from it: to check one, run `/coding-productivity:developers`, which resolves pseudonyms locally. Two different people with the same name are the typical false positive. Undo one by adding the two emails to `IDENTITY_NO_MERGE`.
+
+`MIN_ACTIVE_COMMITS` (default 1) is the number of commits a person needs in a month to count as an active developer. At the default nothing changes. Above 1, monthly trends gain two columns, `active_developers` and `productivity_per_active_developer` (the productivity of those developers divided by their number; lines changed when nothing is scored). `unique_authors` stays as it was, so both views are visible. The columns appear only above 1 so the default output and every existing number stay as they were.
+
+### Repo coverage
+
+With an explicit `REPOS` list, `extract` makes one listing call per GitHub organization (the owners in `REPOS`) or GitLab group (the group that directly holds each configured project, subgroups included) and warns about active, non-archived repos that are not in `REPOS`, and about configured repos that are now archived. It only warns: what is extracted does not change. Not run with `--repo` / `--project`.
+
 ### Anonymization
 
 Developer identities are HMAC-SHA256 hashed by default. The pseudonymization key is stored in your config file — **back it up**. Losing the key means existing hashes become permanently unresolvable.
@@ -131,6 +149,18 @@ A local reverse mapping file (`.coding-productivity/developer_mapping.json`) all
 - The pseudonymization key and reverse mapping file together can deanonymize the dataset — store backups separately
 - Use fine-grained tokens with minimum required scopes (GitHub: Contents + PRs read; GitLab: `read_api`)
 - Commit diffs are sent to the Anthropic API when scoring is enabled — review their data usage policy for proprietary code
+
+## Limits
+
+What the numbers do and do not say:
+
+- **Deleted lines score zero.** Productivity is the sum over files of `score x max(additions, 1)`. A file with only deletions counts as one line. Cleanup, dead-code removal and refactors that mostly delete look low-value.
+- **Config, docs and translations are weighted low on purpose.** `.md` files are capped at 0.15 in code (the scoring prompt allows 0.15-0.30 and the code cap wins), JSON files over 500 lines (except `package.json`) at 0.05, locale and translation files (`locales/*.yml`, `i18n/*`, `translations/*`) are scored 0.05 without an API call, and lockfiles, minified, generated and build output score 0.0. Work that is mostly docs, config or translation counts for little.
+- **Productivity is score x lines, and size is only handled by the scoring prompt.** The prompt asks for more scrutiny as a change grows (typically 0.2-0.5 for 501-1000 lines, 0.1-0.3 above 1000), but nothing in code limits how many lines a commit can contribute. A very large diff that the model scores generously inflates the total.
+- **Anyone with a commit in a month counts as a developer.** A single commit makes someone one of the developers of that month. Raise `MIN_ACTIVE_COMMITS` to see productivity per developer among people with at least that many commits.
+- **Identities are matched by name and email.** Two people with the same author name are merged unless you list them in `IDENTITY_NO_MERGE`; one person who commits under different names and different emails is not.
+- **A shared email joins everyone who used it.** A non-generic email that several people commit from (a team mailbox, a shared machine config, a CI address with `user.name` set to the triggering person) puts all of them into one person. Review the merge list and use `IDENTITY_NO_MERGE`.
+- **Merge, squash, promotion and copied commits are removed since 0.14.0.** Repos that squash into main and repos that merge PR to staging to main are therefore comparable. Before 0.14.0 one change could be counted up to four times, so a repo with more merge steps looked more productive. Data extracted before 0.14.0 needs `dedupe` (and a re-extraction of merge requests for the squash and promotion rules) to benefit.
 
 ## Known Issues
 

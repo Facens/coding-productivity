@@ -175,6 +175,7 @@ class GitLabClient:
                 "name": project["name"],
                 "path_with_namespace": project["path_with_namespace"],
                 "default_branch": project.get("default_branch", "main"),
+                "archived": bool(project.get("archived")),
                 "last_activity_at": project.get("last_activity_at"),
             })
 
