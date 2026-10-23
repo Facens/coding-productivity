@@ -522,6 +522,9 @@ def test_github_extractor_stores_merge_sha_for_merged_prs_only(duckdb_storage):
                 "merge_commit_sha": sha, "html_url": ""}
 
     class Client:
+        def get_pr_commits(self, repo, number):
+            return []
+
         def get_pull_requests(self, repo, state="all"):
             yield pr(1, "closed", "2026-01-02T00:00:00Z", "abc")
             yield pr(2, "open", None, "testmerge")  # an open PR's sha is a test merge

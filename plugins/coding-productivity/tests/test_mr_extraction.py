@@ -21,6 +21,23 @@ def rows(storage, table="merge_requests"):
 
 # ── GitHub ───────────────────────────────────────────────────────────────────
 
+class FailOnce:
+    """Storage whose first insert into *table* raises, like a BigQuery stream that
+    gave up after its retries."""
+
+    def __init__(self, inner, table):
+        self._inner, self._table, self.failed = inner, table, False
+
+    def insert_batch(self, table, records):
+        if table == self._table and not self.failed:
+            self.failed = True
+            raise RuntimeError("streaming insert failed")
+        return self._inner.insert_batch(table, records)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 def gh_pr(number, *, state="closed", merged_at="2026-01-02T00:00:00Z", sha="abc",
           updated_at="2026-01-02T00:00:00Z", repo="org/repo", id_base=9000):
     return {"id": id_base + number, "number": number, "state": state, "merged_at": merged_at,
@@ -31,9 +48,10 @@ def gh_pr(number, *, state="closed", merged_at="2026-01-02T00:00:00Z", sha="abc"
 
 
 class GhClient:
-    def __init__(self, prs, commits=None):
+    def __init__(self, prs, commits=None, fail=()):
         self.prs = prs
         self.commits = commits or {}  # PR number -> shas; default two per PR
+        self.fail = set(fail)  # PR numbers whose commit fetch raises
         self.asked = []
 
     def get_pull_requests(self, repo, state="all"):
@@ -41,13 +59,15 @@ class GhClient:
 
     def get_pr_commits(self, repo, number):
         self.asked.append((repo, number))
+        if number in self.fail:
+            raise RuntimeError("commit fetch failed")
         shas = self.commits.get(number, [f"c{number}a", f"c{number}b"])
         return [{"sha": s} for s in shas]
 
 
-def gh_extract(storage, prs, repo="org/repo", **kw):
+def gh_extract(storage, prs, repo="org/repo", client=None, batch_size=100, **kw):
     return extract_github._extract_pull_requests(
-        GhClient(prs), storage, repo, since=None, batch_size=100,
+        client or GhClient(prs), storage, repo, since=None, batch_size=batch_size,
         anon_key=None, merges=None, mapping_path=None, **kw)
 
 
@@ -72,64 +92,123 @@ def test_github_stores_a_changed_pr_again_and_fills_a_missing_sha_once(duckdb_st
     assert latest == [{"merge_commit_sha": "abc"}]
 
 
+def legacy_pr(storage, number, repo, id_base):
+    """A PR row stored before PR extraction linked commits: no links."""
+    row = mr(number, name=repo.split("/")[-1], web_url=f"https://github.com/{repo}/pull/{number}")
+    row.update(mr_id=str(id_base + number), project_id="")
+    storage.insert_batch("merge_requests", [row])
+
+
 def test_github_links_carry_the_mr_id_and_are_not_repeated(duckdb_storage):
     gh_extract(duckdb_storage, [gh_pr(1), gh_pr(2)])
     client = GhClient([])
     for _ in range(2):
         extract_github._extract_pr_commit_links(client, duckdb_storage, "org/repo", 100)
+    assert client.asked == []
     links = duckdb_storage.query("SELECT mr_iid, mr_id, commit_sha FROM mr_commits")
     assert len(links) == 4
     assert {(l["mr_iid"], l["mr_id"]) for l in links} == {("1", "9001"), ("2", "9002")}
 
 
-def test_github_refetches_links_of_a_pr_stored_again(duckdb_storage):
+def test_github_backfills_links_of_a_pr_stored_without_any(duckdb_storage):
+    legacy_pr(duckdb_storage, 1, "org/repo", 9000)
+    client = GhClient([])
+    assert extract_github._extract_pr_commit_links(client, duckdb_storage, "org/repo", 100) == 2
+    assert extract_github._extract_pr_commit_links(client, duckdb_storage, "org/repo", 100) == 0
+    assert client.asked == [("org/repo", 1)]
+    links = duckdb_storage.query("SELECT mr_id, commit_sha FROM mr_commits")
+    assert {(l["mr_id"], l["commit_sha"]) for l in links} == {("9001", "c1a"), ("9001", "c1b")}
+
+
+def test_github_links_the_new_commits_of_a_pr_stored_again(duckdb_storage):
     # First seen open with one commit; later merged with more. The new commits are
     # linked, the old link is not repeated.
-    refreshed = set()
-    gh_extract(duckdb_storage, [gh_pr(1, state="open", merged_at=None, sha=None)],
-               refreshed=refreshed)
-    extract_github._extract_pr_commit_links(
-        GhClient([], {1: ["c1a"]}), duckdb_storage, "org/repo", 100, refreshed)
+    gh_extract(duckdb_storage, [], client=GhClient(
+        [gh_pr(1, state="open", merged_at=None, sha=None)], {1: ["c1a"]}))
     assert [r["commit_sha"] for r in rows(duckdb_storage, "mr_commits")] == ["c1a"]
 
-    refreshed = set()
-    assert gh_extract(duckdb_storage, [gh_pr(1, updated_at="2026-01-09T00:00:00Z")],
-                      refreshed=refreshed) == 1
-    extract_github._extract_pr_commit_links(
-        GhClient([], {1: ["c1a", "c1b", "c1c"]}), duckdb_storage, "org/repo", 100, refreshed)
+    merged = gh_pr(1, updated_at="2026-01-09T00:00:00Z")
+    assert gh_extract(duckdb_storage, [], client=GhClient([merged], {1: ["c1a", "c1b", "c1c"]})) == 1
     shas = sorted(r["commit_sha"] for r in rows(duckdb_storage, "mr_commits"))
     assert shas == ["c1a", "c1b", "c1c"]
 
 
 def test_github_unchanged_pr_with_links_is_not_refetched(duckdb_storage):
-    refreshed = set()
-    gh_extract(duckdb_storage, [gh_pr(1)], refreshed=refreshed)
-    extract_github._extract_pr_commit_links(
-        GhClient([]), duckdb_storage, "org/repo", 100, refreshed)
-    refreshed = set()
-    assert gh_extract(duckdb_storage, [gh_pr(1)], refreshed=refreshed) == 0
-    client = GhClient([])
-    extract_github._extract_pr_commit_links(client, duckdb_storage, "org/repo", 100, refreshed)
+    gh_extract(duckdb_storage, [gh_pr(1)])
+    client = GhClient([gh_pr(1)])
+    assert gh_extract(duckdb_storage, [], client=client) == 0
+    extract_github._extract_pr_commit_links(client, duckdb_storage, "org/repo", 100)
     assert client.asked == []
 
 
+def test_github_link_lookups_ignore_the_casing_of_the_repo(duckdb_storage):
+    # Configured as Org/Repo, then as org/repo: the PR rows and the links already
+    # stored still match, so nothing is linked twice.
+    gh_extract(duckdb_storage, [gh_pr(1, repo="Org/Repo")], repo="Org/Repo")
+    assert len(rows(duckdb_storage, "mr_commits")) == 2
+
+    changed = gh_pr(1, repo="Org/Repo", updated_at="2026-01-09T00:00:00Z")
+    assert gh_extract(duckdb_storage, [changed], repo="org/repo") == 1
+    client = GhClient([])
+    extract_github._extract_pr_commit_links(client, duckdb_storage, "org/repo", 100)
+    assert client.asked == []
+    assert len(rows(duckdb_storage, "mr_commits")) == 2
+
+
+def test_github_a_failed_commit_fetch_leaves_the_pr_to_be_stored_with_its_links(duckdb_storage):
+    # Seen open with one commit; then merged with three, but the commit fetch fails
+    # that run: no new PR row, or the next run would see the PR as current and its
+    # new commits would never be linked.
+    opened = gh_pr(1, state="open", merged_at=None, sha=None)
+    merged = gh_pr(1, updated_at="2026-01-09T00:00:00Z")
+    three = {1: ["c1a", "c1b", "c1c"]}
+    assert gh_extract(duckdb_storage, [opened], client=GhClient([opened], {1: ["c1a"]})) == 1
+
+    assert gh_extract(duckdb_storage, [merged], client=GhClient([merged], three, fail={1})) == 0
+    assert len(rows(duckdb_storage)) == 1
+
+    assert gh_extract(duckdb_storage, [merged], client=GhClient([merged], three)) == 1
+    assert len(rows(duckdb_storage)) == 2
+    shas = sorted(r["commit_sha"] for r in rows(duckdb_storage, "mr_commits"))
+    assert shas == ["c1a", "c1b", "c1c"]
+
+
+def test_github_batches_flush_links_with_their_prs_and_skip_a_failed_fetch(duckdb_storage):
+    # batch_size=1 flushes inside the loop; PR 2's commits cannot be fetched.
+    prs = [gh_pr(1), gh_pr(2), gh_pr(3)]
+    client = GhClient(prs, fail={2})
+    assert gh_extract(duckdb_storage, prs, client=client, batch_size=1) == 2
+    assert sorted(r["mr_iid"] for r in rows(duckdb_storage)) == ["1", "3"]
+    assert len(rows(duckdb_storage, "mr_commits")) == 4
+
+
+def test_github_a_failed_link_insert_leaves_the_pr_to_be_stored_again(duckdb_storage):
+    flaky = FailOnce(duckdb_storage, "mr_commits")
+    with pytest.raises(RuntimeError):
+        gh_extract(flaky, [gh_pr(1)])
+    assert rows(duckdb_storage) == []  # no PR row without its links
+    assert gh_extract(flaky, [gh_pr(1)]) == 1
+    assert len(rows(duckdb_storage, "mr_commits")) == 2
+
+
 def test_github_same_named_repos_do_not_share_prs_or_links(duckdb_storage, capsys):
-    gh_extract(duckdb_storage, [gh_pr(1, repo="a/repo", id_base=1000)], repo="a/repo")
+    legacy_pr(duckdb_storage, 1, "a/repo", 1000)
     gh_extract(duckdb_storage, [gh_pr(1, repo="b/repo", id_base=2000),
                                 gh_pr(2, repo="b/repo", id_base=2000)], repo="b/repo")
     capsys.readouterr()
     gh_extract(duckdb_storage, [], repo="a/repo")
     assert "[a/repo] 1 existing PRs" in capsys.readouterr().out
 
+    # b/repo's link for PR 1 does not stand in for a/repo's.
     client = GhClient([])
     extract_github._extract_pr_commit_links(client, duckdb_storage, "a/repo", 100)
     assert client.asked == [("a/repo", 1)]
-    links = duckdb_storage.query("SELECT mr_id, project_id FROM mr_commits")
+    links = duckdb_storage.query("SELECT mr_id, project_id FROM mr_commits WHERE project_id = 'a/repo'")
     assert {(l["mr_id"], l["project_id"]) for l in links} == {("1001", "a/repo")}
 
 
 def test_github_underscore_in_a_repo_name_is_not_a_wildcard(duckdb_storage, capsys):
-    gh_extract(duckdb_storage, [gh_pr(1, repo="a/my-repo", id_base=1000)], repo="a/my-repo")
+    legacy_pr(duckdb_storage, 1, "a/my-repo", 1000)
     capsys.readouterr()
     gh_extract(duckdb_storage, [], repo="a/my_repo")
     assert "[a/my_repo] 0 existing PRs" in capsys.readouterr().out
@@ -191,23 +270,6 @@ def test_gitlab_reextraction_is_idempotent(duckdb_storage):
     latest = {r["mr_iid"]: r for r in duckdb_storage.query(
         f"SELECT m.mr_iid, m.state, m.squash_commit_sha FROM {merge_requests.LATEST_MRS} m")}
     assert latest["2"]["state"] == "merged" and latest["2"]["squash_commit_sha"] == "sq2"
-
-
-class FailOnce:
-    """Storage whose first insert into *table* raises, like a BigQuery stream that
-    gave up after its retries."""
-
-    def __init__(self, inner, table):
-        self._inner, self._table, self.failed = inner, table, False
-
-    def insert_batch(self, table, records):
-        if table == self._table and not self.failed:
-            self.failed = True
-            raise RuntimeError("streaming insert failed")
-        return self._inner.insert_batch(table, records)
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
 
 
 def test_gitlab_a_failed_link_insert_leaves_the_mr_to_be_refetched(duckdb_storage):
