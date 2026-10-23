@@ -51,7 +51,7 @@ from typing import Any, Iterable, Iterator
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR))
 
-from lib import scoring, scoring_meta
+from lib import dialect, scoring, scoring_meta
 from lib.config import Config
 from lib.storage import get_storage
 
@@ -196,13 +196,41 @@ def _eligible_shas(storage, excluded: list[str]) -> list[str]:
     return [r["commit_sha"] for r in rows]
 
 
-def _commit(storage, sha: str) -> dict:
-    rows = storage.query("SELECT * FROM commits WHERE commit_sha = $sha", {"sha": sha})
-    return rows[0] if rows else {"commit_sha": sha}
+FETCH_CHUNK = 250      # commits per bulk query
+FETCH_WINDOW = 2000    # commits read ahead while building batch requests
+FETCH_WORKERS = 8      # parallel bulk queries (BigQuery; DuckDB reads on one thread)
 
 
-def _diffs(storage, sha: str) -> list[dict]:
-    return storage.query("SELECT * FROM diffs WHERE commit_sha = $sha", {"sha": sha})
+def _fetch_chunk(storage, shas: list[str]) -> dict[str, tuple[dict, list[dict]]]:
+    match = dialect.in_list_param(storage, "commit_sha", "$shas")
+    params = {"shas": list(shas)}
+    commits = {r["commit_sha"]: r for r in
+               storage.query(f"SELECT * FROM commits WHERE {match}", params)}
+    diffs: dict[str, list[dict]] = {sha: [] for sha in shas}
+    for r in storage.query(f"SELECT * FROM diffs WHERE {match}", params):
+        diffs.setdefault(r["commit_sha"], []).append(r)
+    return {sha: (commits.get(sha, {"commit_sha": sha}), d) for sha, d in diffs.items()}
+
+
+def _prefetch(storage, shas: Iterable[str],
+              workers: int = FETCH_WORKERS) -> dict[str, tuple[dict, list[dict]]]:
+    """``{sha: (commit, diffs)}`` for *shas*, read in bulk.
+
+    One query per commit made a rebase of tens of thousands of commits take
+    days on BigQuery; chunks of FETCH_CHUNK shas, run in parallel there, take
+    minutes. DuckDB connections are not thread-safe, so DuckDB reads serially.
+    """
+    unique = list(dict.fromkeys(shas))
+    chunks = [unique[i:i + FETCH_CHUNK] for i in range(0, len(unique), FETCH_CHUNK)]
+    out: dict[str, tuple[dict, list[dict]]] = {}
+    if dialect.of(storage) == dialect.BIGQUERY and workers > 1 and len(chunks) > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for part in pool.map(lambda c: _fetch_chunk(storage, c), chunks):
+                out.update(part)
+    else:
+        for c in chunks:
+            out.update(_fetch_chunk(storage, c))
+    return out
 
 
 def _write_rows(storage, state: dict, commit_rows: list[dict], file_rows: list[dict]) -> None:
@@ -223,10 +251,14 @@ def _write_rows(storage, state: dict, commit_rows: list[dict], file_rows: list[d
 
 def _iter_requests(storage, state: dict, settings: scoring.ScoringSettings,
                    start: int) -> Iterator[tuple[str, dict]]:
-    for i in range(start, len(state["shas"])):
-        sha = state["shas"][i]
-        prompt = scoring.build_user_prompt(_commit(storage, sha), _diffs(storage, sha))
-        yield custom_id_for(i), settings.build_params(prompt)
+    shas = state["shas"]
+    for w in range(start, len(shas), FETCH_WINDOW):
+        window = shas[w:w + FETCH_WINDOW]
+        data = _prefetch(storage, window)
+        for j, sha in enumerate(window):
+            commit, diffs = data.get(sha, ({"commit_sha": sha}, []))
+            prompt = scoring.build_user_prompt(commit, diffs)
+            yield custom_id_for(w + j), settings.build_params(prompt)
 
 
 def _submit_chunk(client, state: dict, chunk: list[tuple[str, dict]], save,
@@ -315,7 +347,17 @@ def process_batch(client, storage, state: dict, entry: dict, settings, save) -> 
     file_rows: list[dict] = []
     counts: Counter = Counter()
 
-    for item in client.messages.batches.results(entry["id"]):
+    items = list(client.messages.batches.results(entry["id"]))
+    wanted = []
+    for item in items:
+        try:
+            wanted.append(state["shas"][index_of(item.custom_id)])
+        except (ValueError, IndexError, AttributeError):
+            pass
+    diffs_by_sha = {sha: d for sha, (_c, d) in
+                    _prefetch(storage, [s for s in wanted if s not in existing]).items()}
+
+    for item in items:
         try:
             sha = state["shas"][index_of(item.custom_id)]
         except (ValueError, IndexError, AttributeError):
@@ -333,7 +375,7 @@ def process_batch(client, storage, state: dict, entry: dict, settings, save) -> 
 
         rows = None
         if score_result is not None:
-            diffs = _diffs(storage, sha)
+            diffs = diffs_by_sha.get(sha, [])
             try:
                 rows = scoring.rows_from_result(
                     sha, score_result, diffs, model, settings.prompt_version,
@@ -400,7 +442,8 @@ def sync_fallback(client, storage, state: dict, settings, workers: int, save,
           flush=True)
 
     # DuckDB connections are not thread-safe: read on the main thread.
-    inputs = {sha: (_commit(storage, sha), _diffs(storage, sha)) for sha in todo}
+    fetched = _prefetch(storage, todo)
+    inputs = {sha: fetched.get(sha, ({"commit_sha": sha}, [])) for sha in todo}
 
     commit_rows: list[dict] = []
     file_rows: list[dict] = []
