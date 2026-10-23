@@ -131,6 +131,10 @@ A developer count that depends on how many addresses someone commits from is wro
 
 The default changed in 0.16.0 (it was the authored date). For repos with rebases and cherry-picks, monthly numbers move by a few percent; set `DATE_FIELD=authored_date` to reproduce older figures.
 
+### Importing an alias table
+
+If an earlier pipeline kept a table of aliases, load it instead of retyping it: `python3.14 scripts/import_aliases.py --config .coding-productivity.env --csv aliases.csv` (or `/coding-productivity:developers`, "Import aliases"). The CSV has the header `original_email,canonical_email`. Each pair is added to `IDENTITY_MERGES` (lowercased; existing entries stay). Pairs whose two addresses are equal are skipped. A pair is refused when a value is empty or contains `,` or `:` (either would corrupt the comma-separated setting) or when the alias is already merged into a different address; refused lines are listed by line number and the exit code is 1, the valid pairs are written anyway. `--dry-run` shows the counts first. Stored data is not rewritten; `analyze` applies the merges when it counts developers.
+
 ### Repo coverage
 
 With an explicit `REPOS` list, `extract` makes one listing call per GitHub organization (the owners in `REPOS`) or GitLab group (the group that directly holds each configured project, subgroups included) and warns about active, non-archived repos that are not in `REPOS`, and about configured repos that are now archived. It only warns: what is extracted does not change. Not run with `--repo` / `--project`.
