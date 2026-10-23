@@ -17,12 +17,16 @@ Identity resolution at analysis time, a threshold for "active" developers, a rep
 
 - Non-person accounts (every stored name generic, such as `root`) are removed from every `analyze` query through the excluded-developers filter, commits and productivity included, as bots are. Bots were already dropped at extraction; this covers what is already stored. A person who has used a generic name on an email that also carries a real name is not excluded.
 - `unique_authors` (monthly trends, period comparison) counts people, not emails. The author table has one row per person, under its most-used stored name and email, and is sorted and limited by person. Identities are resolved over the whole dataset (REPOS and `EXCLUDED_DEVELOPERS` applied, dates not), so one person keeps one identity across periods.
+- With anonymization on, the merge report shows pseudonyms, not names, and says so; `/coding-productivity:developers` resolves them locally. `run` now relays the repo coverage warnings and the `identity:` lines, and its summary shows the number of merged identities.
+- `period_comparison` keys the per-period people counts by the period label, not by row position, so the result no longer depends on the order the database returns the two rows. The SQL `unique_authors` columns are `NULL` placeholders filled per person afterwards.
+- The `IDENTITY_NO_MERGE` example in the report pairs two emails that differ by more than case.
 - The excluded-developers clause is NULL-safe: commits with no author email are no longer dropped whenever `EXCLUDED_DEVELOPERS` is set.
 
 ### Upgrade notes
 
 - Developer counts and the author table can go down after upgrading. That is the fix, not a regression; re-read published figures. Set `IDENTITY_AUTO_MERGE=false` to get only explicit merges and the non-person exclusion.
-- Two different people who share an author name are merged until you list their emails in `IDENTITY_NO_MERGE`.
+- Two different people who share an author name are merged until you list their emails in `IDENTITY_NO_MERGE`. The same goes for a shared non-generic email (team mailbox, CI address).
+- `validate` references produced before 0.15.0 counted emails in `unique_authors`; it now counts people. Regenerate the reference, or set `IDENTITY_AUTO_MERGE=false` to compare.
 - New datasets still store accounts such as `root`; they are excluded at analysis time.
 
 ## 0.14.0
