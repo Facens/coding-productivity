@@ -11,7 +11,7 @@ import abc
 import re
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from . import schema as _schema
 
@@ -51,6 +51,22 @@ class Storage(abc.ABC):
 
     @abc.abstractmethod
     def query(self, sql: str, params: Optional[dict] = None) -> list[dict[str, Any]]: ...
+
+    @abc.abstractmethod
+    def iter_query(self, sql: str, params: Optional[dict] = None,
+                   page_size: int = 10_000) -> Iterator[dict[str, Any]]:
+        """Like ``query`` but yields rows lazily, ``page_size`` at a time, so a
+        scan over a large table (``diffs``) never sits in memory whole."""
+
+    @abc.abstractmethod
+    def replace_table(self, table: str, records: list[dict[str, Any]]) -> None:
+        """Replace the entire contents of *table* with *records*.
+
+        For tables that are rebuilt wholesale (``duplicate_commits``...). On
+        DuckDB it is one transaction; on BigQuery a load job with
+        ``WRITE_TRUNCATE``, because DELETE/TRUNCATE fail on rows still in the
+        streaming buffer and streaming into a just-recreated table can lose rows.
+        """
 
     @abc.abstractmethod
     def get_existing_shas(self, table: str) -> set[str]: ...
@@ -177,6 +193,40 @@ class DuckDBStorage(Storage):
             result = self._conn.execute(sql)
         col_names = [desc[0] for desc in result.description]
         return [dict(zip(col_names, row)) for row in result.fetchall()]
+
+    def iter_query(self, sql: str, params: Optional[dict] = None,
+                   page_size: int = 10_000) -> Iterator[dict[str, Any]]:
+        # A cursor of its own, so queries issued while the caller is still
+        # consuming the stream do not disturb it.
+        cur = self._conn.cursor()
+        try:
+            result = cur.execute(sql, params) if params else cur.execute(sql)
+            cols = [d[0] for d in result.description]
+            while True:
+                rows = result.fetchmany(page_size)
+                if not rows:
+                    return
+                for row in rows:
+                    yield dict(zip(cols, row))
+        finally:
+            cur.close()
+
+    def replace_table(self, table: str, records: list[dict[str, Any]]) -> None:
+        self._assert_writable()
+        columns = _schema.get_columns(table)  # validates the table name
+        sql = (f"INSERT INTO {table} ({', '.join(columns)}) "
+               f"VALUES ({', '.join(['?'] * len(columns))})")
+        rows = [tuple(r.get(c) for c in columns) for r in records]
+        with self._lock:
+            self._conn.execute("BEGIN TRANSACTION")
+            try:
+                self._conn.execute(f"DELETE FROM {table}")
+                if rows:
+                    self._conn.executemany(sql, rows)
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._conn.execute("COMMIT")
 
     def get_existing_shas(self, table: str) -> set[str]:
         rows = self._conn.execute(
@@ -346,7 +396,9 @@ class BigQueryStorage(Storage):
                 )
             _sleep(_STREAM_RETRY_DELAYS[attempt])
 
-    def query(self, sql: str, params: Optional[dict] = None) -> list[dict[str, Any]]:
+    def _job(self, sql: str, params: Optional[dict]):
+        """``(sql, QueryJobConfig)`` for a query using the plugin's ``$name``
+        placeholders."""
         from google.cloud import bigquery as bq
 
         # Default dataset lets unqualified table names (as used by the
@@ -363,9 +415,39 @@ class BigQueryStorage(Storage):
             job_config.query_parameters = [
                 self._query_param(bq, k, v) for k, v in params.items()
             ]
+        return sql, job_config
 
+    def query(self, sql: str, params: Optional[dict] = None) -> list[dict[str, Any]]:
+        sql, job_config = self._job(sql, params)
         result = self._client.query(sql, job_config=job_config).result()
         return [dict(row) for row in result]
+
+    def iter_query(self, sql: str, params: Optional[dict] = None,
+                   page_size: int = 10_000) -> Iterator[dict[str, Any]]:
+        sql, job_config = self._job(sql, params)
+        result = self._client.query(sql, job_config=job_config).result(page_size=page_size)
+        for row in result:
+            yield dict(row)
+
+    def replace_table(self, table: str, records: list[dict[str, Any]]) -> None:
+        self._assert_writable()
+        from google.cloud import bigquery as bq
+
+        columns = _schema.get_columns(table)  # validates the table name
+        ref = self._table_ref(table)
+        if not records:
+            # An empty load job is rejected; TRUNCATE has no rows to trip on.
+            self._client.query(f"TRUNCATE TABLE `{ref}`").result()
+            return
+        bq_schema = [
+            bq.SchemaField(col, self._TYPE_MAP.get(dtype, "STRING"))
+            for col, dtype in _schema.get_column_types(table).items()
+        ]
+        job_config = bq.LoadJobConfig(
+            schema=bq_schema, write_disposition="WRITE_TRUNCATE"
+        )
+        rows = [{c: r.get(c) for c in columns} for r in records]
+        self._client.load_table_from_json(rows, ref, job_config=job_config).result()
 
     @staticmethod
     def _query_param(bq, name: str, value: Any):

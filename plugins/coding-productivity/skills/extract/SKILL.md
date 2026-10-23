@@ -187,13 +187,15 @@ If `SCORING_ENABLED=true`:
 > What would you like to do next?
 >
 > 1. Run /coding-productivity:score to add AI-powered analysis
-> 2. Run /coding-productivity:analyze to view productivity metrics
-> 3. Nothing for now
+> 2. Run /coding-productivity:dedupe to detect duplicate work (recommended after every extraction, before analyze)
+> 3. Run /coding-productivity:analyze to view productivity metrics
+> 4. Nothing for now
 
 If `SCORING_ENABLED` is false or not set:
 > What would you like to do next?
 >
-> 1. Run /coding-productivity:analyze to view productivity metrics
-> 2. Nothing for now
+> 1. Run /coding-productivity:dedupe to detect duplicate work (recommended after every extraction, before analyze)
+> 2. Run /coding-productivity:analyze to view productivity metrics
+> 3. Nothing for now
 
 If the user chooses an option, tell them to run the corresponding command.
