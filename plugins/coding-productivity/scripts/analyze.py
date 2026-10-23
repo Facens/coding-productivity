@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dataclasses import dataclass, field
 
 from lib import duplicate_work as dw
+from lib import identity
 from lib import scoring_meta
 from lib.merge_requests import LATEST_MRS
 from lib.config import Config
@@ -64,9 +65,78 @@ def _excluded_devs_filter(config: Config) -> tuple[str, dict]:
     if not excluded:
         return "", {}
     placeholders = ", ".join(f"$excl_{i}" for i in range(len(excluded)))
-    clause = f"c.author_email NOT IN ({placeholders})"
+    # NULL-safe: "NULL NOT IN (...)" is NULL, which would drop commits with no email.
+    clause = f"(c.author_email IS NULL OR c.author_email NOT IN ({placeholders}))"
     params = {f"excl_{i}": e for i, e in enumerate(excluded)}
     return clause, params
+
+
+# ── Identity: who counts as one developer ───────────────────────────────────
+
+class _Scope:
+    """*config* with *extra* emails added to ``EXCLUDED_DEVELOPERS``.
+
+    Non-person accounts are removed from every query through the filter that
+    already drops excluded developers, so no query needs its own clause.
+    """
+
+    def __init__(self, config, extra: list[str]):
+        self._config = config
+        self._extra = extra
+
+    @property
+    def EXCLUDED_DEVELOPERS(self) -> list[str]:
+        base = list(getattr(self._config, "EXCLUDED_DEVELOPERS", []) or [])
+        return base + [e for e in self._extra if e not in base]
+
+    def __getattr__(self, name):
+        return getattr(self._config, name)
+
+
+def load_people(storage: Storage, config: Config) -> identity.People:
+    """Resolve the stored identities of the whole dataset (REPOS and excluded
+    developers applied, dates not) into people. All dates are used on purpose:
+    one person keeps one key across the baseline and the comparison period."""
+    clauses: list[str] = []
+    params: dict = {}
+    for clause, clause_params in (_repo_filter(config), _excluded_devs_filter(config)):
+        if clause:
+            clauses.append(clause)
+            params.update(clause_params)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = storage.query(f"""
+        SELECT c.author_name AS author_name, c.author_email AS author_email,
+               COUNT(DISTINCT c.commit_sha) AS commits
+        FROM commits c {where}
+        GROUP BY c.author_name, c.author_email""", params)
+    anonymized = bool(getattr(config, "ANONYMIZATION_ENABLED", False))
+    return identity.resolve(
+        [(r["author_name"], r["author_email"], r["commits"]) for r in rows],
+        merges=getattr(config, "IDENTITY_MERGES", None) or {},
+        no_merge=getattr(config, "IDENTITY_NO_MERGE", None) or [],
+        auto=getattr(config, "IDENTITY_AUTO_MERGE", True),
+        key=getattr(config, "PSEUDONYMIZATION_KEY", None) if anonymized else None,
+    )
+
+
+def _scoped(storage: Storage, config: Config,
+            people: Optional[identity.People] = None) -> tuple[_Scope, identity.People]:
+    """``(config without non-person accounts, people)`` for one query."""
+    if people is None:
+        people = load_people(storage, config)
+    return _Scope(config, people.non_person_emails()), people
+
+
+def _min_active_commits(config) -> int:
+    return max(1, int(getattr(config, "MIN_ACTIVE_COMMITS", 1) or 1))
+
+
+def identity_notes(storage: Storage, config: Config,
+                   people: Optional[identity.People] = None) -> list[str]:
+    """Lines listing the automatic merges and excluded non-person accounts."""
+    people = people or load_people(storage, config)
+    return identity.format_report(
+        people, anonymized=bool(getattr(config, "ANONYMIZATION_ENABLED", False)))
 
 
 def _build_where(config: Config, since: str, until: str,
@@ -371,9 +441,38 @@ def check_single_scorer_model(storage: Storage, config: Config,
 
 # ── Query functions ──────────────────────────────────────────────────────────
 
+def _monthly_people(storage: Storage, where: str, params: dict, src: _Source,
+                    scored: bool) -> list[dict]:
+    """Per month and stored author email: commits and productivity (or lines)."""
+    if scored:
+        value = "COALESCE(SUM(s.total_productivity), 0)"
+        join = f"LEFT JOIN {src.scores} s ON c.commit_sha = s.commit_sha"
+    else:
+        value, join = src.lines_sum, src.lines_join
+    return storage.query(f"""
+        {_with(*src.ctes)}SELECT
+            date_trunc('month', c.authored_date) AS month,
+            c.author_email AS author_email,
+            COUNT(DISTINCT c.commit_sha) AS commits,
+            {value} AS value
+        FROM commits c
+        {join}
+        {where}
+        GROUP BY date_trunc('month', c.authored_date), c.author_email
+        """, params)
+
+
 def monthly_trends(storage: Storage, config: Config,
-                   since: str, until: str) -> list[dict]:
-    """Monthly commit count, total productivity, avg weighted score, unique authors."""
+                   since: str, until: str,
+                   people: Optional[identity.People] = None) -> list[dict]:
+    """Monthly commit count, total productivity, avg weighted score, developers.
+
+    ``unique_authors`` counts people, not emails (see ``lib/identity.py``).
+    With ``MIN_ACTIVE_COMMITS`` above 1 two columns are added: the developers
+    with at least that many commits in the month, and the productivity (lines
+    changed when unscored) of those developers per developer.
+    """
+    config, people = _scoped(storage, config, people)
     scored = _has_scores(storage)
     src = _source(storage, scored)
     where, params = _build_where(config, since, until, src.excl)
@@ -406,13 +505,37 @@ def monthly_trends(storage: Storage, config: Config,
         ORDER BY month
         """
 
-    return storage.query(sql, params)
+    rows = storage.query(sql, params)
+
+    months: dict = {}
+    for r in _monthly_people(storage, where, params, src, scored):
+        if r["author_email"] is None:
+            continue
+        cell = months.setdefault(r["month"], {}).setdefault(
+            people.key(r["author_email"]), [0, 0.0])
+        cell[0] += r["commits"]
+        cell[1] += r["value"] or 0
+
+    threshold = _min_active_commits(config)
+    for row in rows:
+        persons = months.get(row["month"], {})
+        row["unique_authors"] = len(persons)
+        if threshold > 1:
+            active = [v for v in persons.values() if v[0] >= threshold]
+            row["active_developers"] = len(active)
+            per_dev = round(sum(v[1] for v in active) / len(active), 2) if active else None
+            row["productivity_per_active_developer" if scored
+                else "lines_per_active_developer"] = per_dev
+    return rows
 
 
 def period_comparison(storage: Storage, config: Config,
                       baseline_start: str, baseline_end: str,
-                      comparison_start: str, comparison_end: str) -> list[dict]:
-    """Before/after metrics with percentage change."""
+                      comparison_start: str, comparison_end: str,
+                      people: Optional[identity.People] = None) -> list[dict]:
+    """Before/after metrics with percentage change (``unique_authors`` counts
+    people, not emails)."""
+    config, people = _scoped(storage, config, people)
     scored = _has_scores(storage)
     src = _source(storage, scored)
 
@@ -511,6 +634,17 @@ def period_comparison(storage: Storage, config: Config,
 
     rows = storage.query(sql, params)
 
+    if len(rows) == 2:
+        for row, (start, end) in zip(rows, ((baseline_start, baseline_end),
+                                            (comparison_start, comparison_end))):
+            emails = storage.query(f"""
+                SELECT DISTINCT c.author_email AS author_email FROM commits c
+                WHERE c.authored_date >= $start AND c.authored_date < $end
+                      {extra_sql}""",
+                {**repo_params, **excl_params, "start": start, "end": end})
+            row["unique_authors"] = len({people.key(e["author_email"])
+                                         for e in emails if e["author_email"] is not None})
+
     # Compute percentage change and append.
     if len(rows) == 2:
         b, c = rows[0], rows[1]
@@ -530,75 +664,105 @@ def period_comparison(storage: Storage, config: Config,
 
 
 def author_productivity(storage: Storage, config: Config,
-                        since: str, until: str, limit: int = 20) -> list[dict]:
-    """Per-author: commits, total productivity, avg score, top category."""
+                        since: str, until: str, limit: int = 20,
+                        people: Optional[identity.People] = None) -> list[dict]:
+    """Per person: commits, total productivity, avg score, top category.
+
+    One row per person (see ``lib/identity.py``), named after the identity
+    with the most commits. The groups are summed in Python: the query returns
+    one row per stored identity, a few thousand at most.
+    """
+    config, people = _scoped(storage, config, people)
     scored = _has_scores(storage)
     src = _source(storage, scored)
     where, params = _build_where(config, since, until, src.excl)
-    params["lim"] = limit
 
     if scored:
         sql = f"""
-        {_cte_prefix(src.ctes)}author_stats AS (
-            SELECT
-                c.author_name,
-                c.author_email,
-                COUNT(DISTINCT c.commit_sha) AS commits,
-                ROUND(COALESCE(SUM(s.total_productivity), 0), 2) AS total_productivity,
-                ROUND(COALESCE(AVG(s.weighted_score), 0), 3) AS avg_weighted_score
-            FROM commits c
-            LEFT JOIN {src.scores} s ON c.commit_sha = s.commit_sha
-            {where}
-            GROUP BY c.author_name, c.author_email
-        ),
-        top_cats AS (
-            SELECT
-                c.author_email,
-                s.overall_category,
-                COUNT(*) AS cat_count,
-                ROW_NUMBER() OVER (
-                    PARTITION BY c.author_email ORDER BY COUNT(*) DESC
-                ) AS rn
-            FROM commits c
-            JOIN {src.scores} s ON c.commit_sha = s.commit_sha
-            {where}
-            GROUP BY c.author_email, s.overall_category
-        )
-        SELECT
-            a.author_name,
-            a.author_email,
-            a.commits,
-            a.total_productivity,
-            a.avg_weighted_score,
-            COALESCE(tc.overall_category, '-') AS top_category
-        FROM author_stats a
-        LEFT JOIN top_cats tc
-            ON a.author_email = tc.author_email AND tc.rn = 1
-        ORDER BY a.total_productivity DESC
-        LIMIT $lim
+        {_with(*src.ctes)}SELECT
+            c.author_name AS author_name,
+            c.author_email AS author_email,
+            COUNT(DISTINCT c.commit_sha) AS commits,
+            COALESCE(SUM(s.total_productivity), 0) AS total_productivity,
+            COALESCE(SUM(s.weighted_score), 0) AS score_sum,
+            COUNT(s.weighted_score) AS score_count
+        FROM commits c
+        LEFT JOIN {src.scores} s ON c.commit_sha = s.commit_sha
+        {where}
+        GROUP BY c.author_name, c.author_email
         """
+        categories = storage.query(f"""
+        {_with(*src.ctes)}SELECT
+            c.author_email AS author_email,
+            s.overall_category AS category,
+            COUNT(*) AS cat_count
+        FROM commits c
+        JOIN {src.scores} s ON c.commit_sha = s.commit_sha
+        {where}
+        GROUP BY c.author_email, s.overall_category
+        """, params)
     else:
         sql = f"""
         {_with(*src.ctes)}SELECT
-            c.author_name,
-            c.author_email,
+            c.author_name AS author_name,
+            c.author_email AS author_email,
             COUNT(DISTINCT c.commit_sha) AS commits,
             {src.lines_sum} AS total_lines_changed
         FROM commits c
         {src.lines_join}
         {where}
         GROUP BY c.author_name, c.author_email
-        ORDER BY total_lines_changed DESC
-        LIMIT $lim
         """
+        categories = []
 
-    return storage.query(sql, params)
+    # person key -> accumulated row; the identity with most commits names it.
+    merged: dict = {}
+    for r in storage.query(sql, params):
+        if r["author_email"] is None:
+            continue
+        acc = merged.setdefault(people.key(r["author_email"]), {
+            "best": (-1, "", ""), "commits": 0, "total": 0.0,
+            "score_sum": 0.0, "score_count": 0, "cats": {}})
+        acc["best"] = max(acc["best"], (r["commits"], r["author_name"] or "",
+                                        r["author_email"]),
+                          key=lambda b: (b[0], b[2]))
+        acc["commits"] += r["commits"]
+        acc["total"] += (r["total_productivity"] if scored
+                         else r["total_lines_changed"]) or 0
+        if scored:
+            acc["score_sum"] += r["score_sum"] or 0
+            acc["score_count"] += r["score_count"]
+    for r in categories:
+        acc = merged.get(people.key(r["author_email"]))
+        if acc is not None:
+            cats = acc["cats"]
+            cats[r["category"]] = cats.get(r["category"], 0) + r["cat_count"]
+
+    out = []
+    for acc in merged.values():
+        _count, name, email = acc["best"]
+        row = {"author_name": name, "author_email": email, "commits": acc["commits"]}
+        if scored:
+            row["total_productivity"] = round(acc["total"], 2)
+            row["avg_weighted_score"] = (
+                round(acc["score_sum"] / acc["score_count"], 3) if acc["score_count"] else 0)
+            row["top_category"] = (
+                min(acc["cats"], key=lambda c: (-acc["cats"][c], str(c)))
+                if acc["cats"] else "-")
+        else:
+            row["total_lines_changed"] = round(acc["total"], 1)
+        out.append(row)
+    sort_key = "total_productivity" if scored else "total_lines_changed"
+    out.sort(key=lambda r: (-r[sort_key], -r["commits"], r["author_email"]))
+    return out[:limit]
 
 
 def merge_velocity(storage: Storage, config: Config,
-                   since: str, until: str) -> list[dict]:
+                   since: str, until: str,
+                   people: Optional[identity.People] = None) -> list[dict]:
     """Monthly: total MRs, merged count, merge rate %, avg time to merge (days),
     velocity at 7d and 30d windows."""
+    config, people = _scoped(storage, config, people)
     # Use merge_requests table; filter by created_at.
     repo_clause, repo_params = _repo_filter(config)
     excl_clause, excl_params = _excluded_devs_filter(config)
@@ -663,10 +827,12 @@ def merge_velocity(storage: Storage, config: Config,
 
 
 def category_distribution(storage: Storage, config: Config,
-                          since: str, until: str) -> list[dict]:
+                          since: str, until: str,
+                          people: Optional[identity.People] = None) -> list[dict]:
     """Category, count, % of total, avg score."""
     if not _has_scores(storage):
         return []
+    config, people = _scoped(storage, config, people)
 
     src = _source(storage, True)
     where, params = _build_where(config, since, until, src.excl)
@@ -698,9 +864,11 @@ def category_distribution(storage: Storage, config: Config,
 
 
 def code_efficiency(storage: Storage, config: Config,
-                    since: str, until: str) -> list[dict]:
+                    since: str, until: str,
+                    people: Optional[identity.People] = None) -> list[dict]:
     """Monthly: total additions from all commits, additions from merged commits,
     efficiency ratio."""
+    config, people = _scoped(storage, config, people)
     repo_clause, repo_params = _repo_filter(config)
     excl_clause, excl_params = _excluded_devs_filter(config)
 
@@ -933,6 +1101,10 @@ def main():
         print(msg, file=sys.stdout if args.output_format == "table" else sys.stderr)
 
     try:
+        # Who counts as one developer: resolved once, shared by every query.
+        people = load_people(storage, config)
+        scope = _Scope(config, people.non_person_emails())
+
         # Determine queries to run.
         if args.query == "all":
             query_names = [q for q in QUERIES if q != "period_comparison"]
@@ -948,7 +1120,7 @@ def main():
             if ranges:
                 try:
                     check_single_scorer_model(
-                        storage, config, ranges,
+                        storage, scope, ranges,
                         allow_legacy_null=args.allow_legacy_null,
                     )
                 except MixedScorerModelError as exc:
@@ -969,9 +1141,11 @@ def main():
             labelled = [("", args.since, args.until)]
         for label, start, end in labelled:
             if start and end:
-                line = dedupe_summary(storage, config, start, end)
+                line = dedupe_summary(storage, scope, start, end)
                 if line:
                     note(f"{label + ' ' if label else ''}{line}")
+        for line in identity_notes(storage, config, people):
+            note(line)
 
         for qname in query_names:
             if qname == "period_comparison":
@@ -985,6 +1159,7 @@ def main():
                     storage, config,
                     args.baseline_start, args.baseline_end,
                     args.comparison_start, args.comparison_end,
+                    people=people,
                 )
             else:
                 if not args.since or not args.until:
@@ -995,10 +1170,11 @@ def main():
                 if qname == "author_productivity":
                     rows = author_productivity(
                         storage, config, args.since, args.until,
-                        limit=args.limit,
+                        limit=args.limit, people=people,
                     )
                 else:
-                    rows = QUERIES[qname](storage, config, args.since, args.until)
+                    rows = QUERIES[qname](storage, config, args.since, args.until,
+                                          people=people)
 
             # Format output.
             if args.output_format == "json":

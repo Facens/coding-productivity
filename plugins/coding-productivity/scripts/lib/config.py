@@ -99,6 +99,21 @@ class Config:
                 result[alias] = canonical
         return result
 
+    def _get_pairs(self, key: str) -> list[tuple[str, str]]:
+        """Parse ``a:b,c:d`` into ``[(a, b), (c, d)]``; unlike ``_get_dict``
+        the same left-hand side may appear more than once."""
+        val = self._data.get(key)
+        if not val:
+            return []
+        result: list[tuple[str, str]] = []
+        for pair in val.split(","):
+            if ":" not in pair:
+                continue
+            left, right = (part.strip() for part in pair.split(":", 1))
+            if left and right:
+                result.append((left, right))
+        return result
+
     # ── Typed accessors ──────────────────────────────────────────────────
 
     @property
@@ -202,6 +217,27 @@ class Config:
     def IDENTITY_MERGES(self) -> dict[str, str]:
         return self._get_dict("IDENTITY_MERGES")
 
+    @property
+    def IDENTITY_AUTO_MERGE(self) -> bool:
+        """Join identities that share a name or an email at analysis time."""
+        return self._get_bool("IDENTITY_AUTO_MERGE", True)
+
+    @property
+    def IDENTITY_NO_MERGE(self) -> list[tuple[str, str]]:
+        """``email1:email2`` pairs the automatic merge must never join."""
+        return self._get_pairs("IDENTITY_NO_MERGE")
+
+    @property
+    def MIN_ACTIVE_COMMITS(self) -> int:
+        """Commits a developer needs in a month to count as active (1 = anyone)."""
+        val = self._get("MIN_ACTIVE_COMMITS")
+        if not val or not val.strip():
+            return 1
+        try:
+            return int(val.strip())
+        except ValueError:
+            return -1  # reported by validate()
+
     # ── Mutation ─────────────────────────────────────────────────────────
 
     def update(self, key: str, value: str) -> None:
@@ -272,6 +308,16 @@ class Config:
             errors.append(
                 "PSEUDONYMIZATION_KEY is required when ANONYMIZATION_ENABLED=true."
             )
+
+        if self.MIN_ACTIVE_COMMITS < 1:
+            errors.append("MIN_ACTIVE_COMMITS must be a positive integer.")
+        raw_no_merge = self._get("IDENTITY_NO_MERGE")
+        if raw_no_merge and raw_no_merge.strip():
+            entries = [e for e in raw_no_merge.split(",") if e.strip()]
+            if len(self.IDENTITY_NO_MERGE) != len(entries):
+                errors.append(
+                    "IDENTITY_NO_MERGE must be comma-separated email1:email2 pairs."
+                )
 
         return errors
 
