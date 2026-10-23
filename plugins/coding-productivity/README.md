@@ -139,6 +139,8 @@ With an explicit `REPOS` list, `extract` makes one listing call per GitHub organ
 
 Developer identities are HMAC-SHA256 hashed by default. The pseudonymization key is stored in your config file — **back it up**. Losing the key means existing hashes become permanently unresolvable.
 
+`PSEUDONYMIZATION_KEY_FORMAT` says how the key string becomes the HMAC key: `text` (default) uses the UTF-8 bytes of the string as written, `hex` decodes it with `bytes.fromhex` (a 64-character hex key becomes 32 raw bytes). The same 64 characters give two different keys, so hashes only match data produced with the same format. Use `hex` when you load data hashed by another pipeline that decoded a hex key, otherwise leave it alone: changing it on a dataset that already holds hashes breaks every lookup, like changing the key. An invalid hex key is reported by `validate` and stops extraction and analysis with an error that does not print the key.
+
 A local reverse mapping file (`.coding-productivity/developer_mapping.json`) allows the plugin to display human-readable names in the developer roster while keeping stored data anonymized. This file is PII and is never committed to version control.
 
 ## Requirements

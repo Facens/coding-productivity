@@ -744,7 +744,7 @@ def main(argv: list[str] | None = None) -> None:
     if cfg.ANONYMIZATION_ENABLED:
         raw_key = cfg.PSEUDONYMIZATION_KEY
         if raw_key:
-            anon_key = anonymize.load_key(raw_key.hex())
+            anon_key = raw_key  # bytes, decoded per PSEUDONYMIZATION_KEY_FORMAT
             merges = cfg.IDENTITY_MERGES or None
             mapping_path = Path(cfg._path).parent / ".coding-productivity" / _MAPPING_FILENAME
         else:

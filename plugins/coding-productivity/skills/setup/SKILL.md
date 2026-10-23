@@ -167,6 +167,7 @@ SCORING_MAX_TOKENS=16000
 
 ANONYMIZATION_ENABLED={true_or_false}
 PSEUDONYMIZATION_KEY={key_or_empty}
+PSEUDONYMIZATION_KEY_FORMAT=text
 
 EXCLUDED_DEVELOPERS=
 BOT_OVERRIDES=
@@ -237,6 +238,7 @@ Which section would you like to modify?
 
 For each section, re-run the corresponding step from above. Important edge cases:
 
+- **`PSEUDONYMIZATION_KEY_FORMAT`**: `text` (default) or `hex`. Write `hex` only when the user is loading data hashed by another pipeline with a hex key decoded to bytes; it is locked with the key once data exists.
 - **Anonymization**: Check if data exists first (`count commits in storage`). If commits > 0, display as **locked**: "Cannot change while data exists. Delete .coding-productivity/data.duckdb and re-extract to change."
 - **Storage backend switch**: Warn "Switching does not migrate data. You'll need to re-extract."
 - **Repo removal**: "Removing a repo does not delete existing data. Analysis filters by active repos."

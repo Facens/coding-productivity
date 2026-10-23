@@ -291,7 +291,6 @@ from pathlib import Path
 from scripts.lib.config import Config
 from scripts.lib.storage import Storage
 from scripts.lib.dedup import merge_identities, apply_retroactive_merges
-from scripts.lib.anonymize import load_key
 
 cfg = Config()
 st = Storage(cfg)
@@ -302,7 +301,7 @@ alias_emails = ['ALIAS_EMAIL']
 merge_identities(canonical_email, alias_emails, cfg)
 
 if cfg.ANONYMIZATION_ENABLED and cfg.PSEUDONYMIZATION_KEY:
-    key = load_key(cfg.PSEUDONYMIZATION_KEY.decode('utf-8'))
+    key = cfg.PSEUDONYMIZATION_KEY  # bytes, decoded per PSEUDONYMIZATION_KEY_FORMAT
     mapping_path = Path('.coding-productivity/developer_mapping.json')
     affected = apply_retroactive_merges(st, mapping_path, key, {'ALIAS_EMAIL': 'CANONICAL_EMAIL'})
     print(f'Retroactive merge applied: {affected} rows updated')
