@@ -482,7 +482,7 @@ def monthly_trends(storage: Storage, config: Config,
         {_with(*src.ctes)}SELECT
             date_trunc('month', c.authored_date) AS month,
             COUNT(DISTINCT c.commit_sha) AS commits,
-            COUNT(DISTINCT c.author_email) AS unique_authors,
+            NULL AS unique_authors,
             ROUND(COALESCE(SUM(s.total_productivity), 0), 2) AS total_productivity,
             ROUND(COALESCE(AVG(s.weighted_score), 0), 3) AS avg_weighted_score
         FROM commits c
@@ -496,7 +496,7 @@ def monthly_trends(storage: Storage, config: Config,
         {_with(*src.ctes)}SELECT
             date_trunc('month', c.authored_date) AS month,
             COUNT(DISTINCT c.commit_sha) AS commits,
-            COUNT(DISTINCT c.author_email) AS unique_authors,
+            NULL AS unique_authors,
             {src.lines_sum} AS total_lines_changed
         FROM commits c
         {src.lines_join}
@@ -505,6 +505,7 @@ def monthly_trends(storage: Storage, config: Config,
         ORDER BY month
         """
 
+    # unique_authors is NULL in the SQL and filled per person below.
     rows = storage.query(sql, params)
 
     months: dict = {}
@@ -564,7 +565,7 @@ def period_comparison(storage: Storage, config: Config,
         {_cte_prefix(src.ctes)}baseline AS (
             SELECT
                 COUNT(DISTINCT c.commit_sha) AS commits,
-                COUNT(DISTINCT c.author_email) AS unique_authors,
+                NULL AS unique_authors,
                 ROUND(COALESCE(SUM(s.total_productivity), 0), 2) AS total_productivity,
                 ROUND(COALESCE(AVG(s.weighted_score), 0), 3) AS avg_weighted_score,
                 COUNT(DISTINCT CAST(c.authored_date AS DATE)) AS active_days
@@ -576,7 +577,7 @@ def period_comparison(storage: Storage, config: Config,
         comparison AS (
             SELECT
                 COUNT(DISTINCT c.commit_sha) AS commits,
-                COUNT(DISTINCT c.author_email) AS unique_authors,
+                NULL AS unique_authors,
                 ROUND(COALESCE(SUM(s.total_productivity), 0), 2) AS total_productivity,
                 ROUND(COALESCE(AVG(s.weighted_score), 0), 3) AS avg_weighted_score,
                 COUNT(DISTINCT CAST(c.authored_date AS DATE)) AS active_days
@@ -602,7 +603,7 @@ def period_comparison(storage: Storage, config: Config,
         {_cte_prefix(src.ctes)}baseline AS (
             SELECT
                 COUNT(DISTINCT c.commit_sha) AS commits,
-                COUNT(DISTINCT c.author_email) AS unique_authors,
+                NULL AS unique_authors,
                 {src.lines_sum} AS total_lines_changed,
                 COUNT(DISTINCT CAST(c.authored_date AS DATE)) AS active_days
             FROM commits c
@@ -613,7 +614,7 @@ def period_comparison(storage: Storage, config: Config,
         comparison AS (
             SELECT
                 COUNT(DISTINCT c.commit_sha) AS commits,
-                COUNT(DISTINCT c.author_email) AS unique_authors,
+                NULL AS unique_authors,
                 {src.lines_sum} AS total_lines_changed,
                 COUNT(DISTINCT CAST(c.authored_date AS DATE)) AS active_days
             FROM commits c
@@ -632,11 +633,16 @@ def period_comparison(storage: Storage, config: Config,
         FROM comparison co
         """
 
+    # unique_authors is NULL in the SQL and filled per person below.
     rows = storage.query(sql, params)
+    # UNION ALL has no ORDER BY: key by label, then put baseline first.
+    rows = sorted(rows, key=lambda r: r["period"] != "baseline")
 
     if len(rows) == 2:
-        for row, (start, end) in zip(rows, ((baseline_start, baseline_end),
-                                            (comparison_start, comparison_end))):
+        ranges = {"baseline": (baseline_start, baseline_end),
+                  "comparison": (comparison_start, comparison_end)}
+        for row in rows:
+            start, end = ranges[row["period"]]
             emails = storage.query(f"""
                 SELECT DISTINCT c.author_email AS author_email FROM commits c
                 WHERE c.authored_date >= $start AND c.authored_date < $end
