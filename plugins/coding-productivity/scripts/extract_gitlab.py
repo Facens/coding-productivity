@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.config import Config
 from lib.storage import get_storage
 from lib.gitlab_client import GitLabClient
-from lib import bots, checkpoint, anonymize, merge_requests
+from lib import bots, checkpoint, anonymize, coverage, merge_requests
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -87,6 +87,7 @@ def _resolve_project_id(client: GitLabClient, identifier: str) -> dict | None:
         "name": data["name"],
         "path_with_namespace": data["path_with_namespace"],
         "default_branch": data.get("default_branch", "main"),
+        "archived": bool(data.get("archived")),
     }
 
 
@@ -509,6 +510,11 @@ def run(
             projects.append(p)
 
     print(f"\n  Projects to process: {len(projects)}", flush=True)
+
+    # ── Coverage: repos added to the group, configured repos now archived ─
+    if not single_project:
+        for line in coverage.gitlab_coverage(client, projects):
+            print(f"  {line}", flush=True)
 
     # ── Process each project ─────────────────────────────────────────────
     grand_commits = 0

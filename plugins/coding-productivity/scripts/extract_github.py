@@ -38,7 +38,7 @@ from lib.storage import get_storage, Storage
 from lib.github_client import GitHubClient
 from lib import checkpoint
 from lib import anonymize
-from lib import bots, merge_requests
+from lib import bots, coverage, merge_requests
 
 # ---------------------------------------------------------------------------
 # Identity columns that must be pseudonymized when anonymization is enabled.
@@ -762,6 +762,11 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  Batch size:  {args.batch_size:,}", flush=True)
     print(f"  Anonymize:   {cfg.ANONYMIZATION_ENABLED}", flush=True)
     print(f"  Storage:     {cfg.STORAGE_BACKEND}", flush=True)
+
+    # Coverage: repos added to the org, configured repos now archived.
+    if not args.repo:
+        for line in coverage.github_coverage(client, repos):
+            print(line, flush=True)
 
     totals: dict = {"commits": 0, "diffs": 0, "prs": 0, "pr_commits": 0}
 
