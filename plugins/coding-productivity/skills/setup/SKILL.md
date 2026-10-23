@@ -173,10 +173,11 @@ BOT_OVERRIDES=
 IDENTITY_MERGES=
 IDENTITY_AUTO_MERGE=true
 IDENTITY_NO_MERGE=
+DATE_FIELD=committed_date
 MIN_ACTIVE_COMMITS=1
 ```
 
-Leave keys blank when not applicable. Then run via Bash:
+Leave keys blank when not applicable. `DATE_FIELD` is `committed_date` (the date a commit reached the branch) unless the user wants to reproduce older figures, in which case write `authored_date`. Then run via Bash:
 
 ```bash
 chmod 600 .coding-productivity.env

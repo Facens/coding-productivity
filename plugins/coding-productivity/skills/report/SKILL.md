@@ -61,7 +61,8 @@ from lib.config import Config
 from lib.storage import get_storage
 cfg = Config()
 st = get_storage(cfg)
-rows = st.query('SELECT MIN(authored_date) AS min_d, MAX(authored_date) AS max_d FROM commits')
+col = 'authored_date' if cfg.DATE_FIELD == 'authored_date' else 'committed_date'
+rows = st.query(f'SELECT MIN({col}) AS min_d, MAX({col}) AS max_d FROM commits')
 print(f'MIN:{rows[0][\"min_d\"]}')
 print(f'MAX:{rows[0][\"max_d\"]}')
 st.close()

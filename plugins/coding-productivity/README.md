@@ -125,6 +125,12 @@ A developer count that depends on how many addresses someone commits from is wro
 
 `MIN_ACTIVE_COMMITS` (default 1) is the number of commits a person needs in a month to count as an active developer. At the default nothing changes. Above 1, monthly trends gain two columns, `active_developers` and `productivity_per_active_developer` (the productivity of those developers divided by their number; lines changed when nothing is scored). `unique_authors` stays as it was, so both views are visible. The columns appear only above 1 so the default output and every existing number stay as they were.
 
+### Commit date
+
+`DATE_FIELD` chooses the date that puts a commit in a month and inside `--since` / `--until`: `committed_date` (default) or `authored_date`. A commit written in January and rebased or cherry-picked in February belongs to February by commit date, so the month is when the change reached the branch. Authored date follows the author's clock and can land far from the merge. The same field is used for monthly trends, period comparison, the author table, categories, code efficiency and the single-model check. Merge velocity buckets by the MR's `created_at`. A commit with no stored `committed_date` is bucketed by its authored date, so nothing drops out.
+
+The default changed in 0.16.0 (it was the authored date). For repos with rebases and cherry-picks, monthly numbers move by a few percent; set `DATE_FIELD=authored_date` to reproduce older figures.
+
 ### Repo coverage
 
 With an explicit `REPOS` list, `extract` makes one listing call per GitHub organization (the owners in `REPOS`) or GitLab group (the group that directly holds each configured project, subgroups included) and warns about active, non-archived repos that are not in `REPOS`, and about configured repos that are now archived. It only warns: what is extracted does not change. Not run with `--repo` / `--project`.

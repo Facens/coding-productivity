@@ -228,6 +228,14 @@ class Config:
         return self._get_pairs("IDENTITY_NO_MERGE")
 
     @property
+    def DATE_FIELD(self) -> str:
+        """Commit date that buckets and filters ``analyze``: ``committed_date``
+        (default) or ``authored_date``. Unknown values are returned as typed
+        and reported by ``validate``."""
+        val = self._get("DATE_FIELD")
+        return val.strip().lower() if val and val.strip() else "committed_date"
+
+    @property
     def MIN_ACTIVE_COMMITS(self) -> int:
         """Commits a developer needs in a month to count as active (1 = anyone)."""
         val = self._get("MIN_ACTIVE_COMMITS")
@@ -309,6 +317,11 @@ class Config:
                 "PSEUDONYMIZATION_KEY is required when ANONYMIZATION_ENABLED=true."
             )
 
+        if self.DATE_FIELD not in ("committed_date", "authored_date"):
+            errors.append(
+                "DATE_FIELD must be committed_date or authored_date, "
+                f"got '{self.DATE_FIELD}'."
+            )
         if self.MIN_ACTIVE_COMMITS < 1:
             errors.append("MIN_ACTIVE_COMMITS must be a positive integer.")
         raw_no_merge = self._get("IDENTITY_NO_MERGE")
