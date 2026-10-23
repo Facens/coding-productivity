@@ -187,6 +187,21 @@ def test_report_lists_merges_and_how_to_undo(tmp_dir):
     assert identity.format_report(identity.resolve(pairs(("A", "a@x.com")))) == []
 
 
+def test_report_undo_example_pairs_two_emails_that_really_differ():
+    # The second most-used email differs from the first only by case: a no-op pair.
+    people = identity.resolve(pairs(("Anna", "Anna@x.com", 5), ("Anna", "anna@x.com", 3),
+                                    ("Anna", "b@y.com", 2)))
+    text = "\n".join(identity.format_report(people))
+    assert "IDENTITY_NO_MERGE=Anna@x.com:b@y.com" in text
+    assert "Anna@x.com:anna@x.com" not in text
+
+
+def test_report_under_anonymization_points_to_the_developers_skill():
+    people = identity.resolve(pairs(("A", "a@x.com", 2), ("A", "b@y.com", 1)))
+    text = "\n".join(identity.format_report(people, anonymized=True))
+    assert "pseudonyms" in text and "/coding-productivity:developers" in text
+
+
 # ── config ───────────────────────────────────────────────────────────────────
 
 def _config(tmp_dir, body):
@@ -282,6 +297,27 @@ def test_period_comparison_counts_people(team):
     assert rows[2]["unique_authors"] == -75.0
 
 
+class _Reversed:
+    """Storage wrapper returning the rows of every multi-row query in reverse."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def query(self, sql, params=None):
+        return list(reversed(self._inner.query(sql, params)))
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_period_comparison_does_not_depend_on_row_order(team):
+    rows = analyze.period_comparison(_Reversed(team), cfg(), *JAN, *FEB)
+    assert [r["period"] for r in rows] == ["baseline", "comparison", "% change"]
+    assert rows[0]["unique_authors"] == 4 and rows[1]["unique_authors"] == 1
+    assert rows[0]["commits"] == 7 and rows[1]["commits"] == 1
+    assert rows[2]["unique_authors"] == -75.0 and rows[2]["commits"] == -85.7
+
+
 def test_author_table_has_one_row_per_person_and_no_root(team):
     rows = analyze.author_productivity(team, cfg(), "2026-01-01", "2026-03-01")
     by_commits = {r["author_name"]: r for r in rows}
@@ -321,6 +357,23 @@ def test_commits_without_an_email_still_count_as_commits(duckdb_storage):
 def test_excluded_developers_stay_out_of_identity_resolution(team):
     jan = analyze.monthly_trends(team, cfg(EXCLUDED_DEVELOPERS=["carla@a.com"]), *JAN)[0]
     assert jan["unique_authors"] == 3 and jan["commits"] == 6
+
+
+def test_null_email_commit_survives_the_non_person_exclusion(team):
+    # The team fixture has a Root account, so the exclusion clause is active.
+    row = person_commit("n1", "Ghost", "x@x.com")
+    row["author_email"] = None
+    team.insert_batch("commits", [row])
+    jan = analyze.monthly_trends(team, cfg(), *JAN)[0]
+    assert jan["commits"] == 8 and jan["unique_authors"] == 4
+
+
+def test_null_email_commit_survives_excluded_developers(team):
+    row = person_commit("n1", "Ghost", "x@x.com")
+    row["author_email"] = None
+    team.insert_batch("commits", [row])
+    jan = analyze.monthly_trends(team, cfg(EXCLUDED_DEVELOPERS=["carla@a.com"]), *JAN)[0]
+    assert jan["commits"] == 7 and jan["unique_authors"] == 3
 
 
 def test_non_persons_are_excluded_from_every_query(team):
