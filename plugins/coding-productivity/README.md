@@ -48,7 +48,7 @@ Or run each step individually:
 - **Duplicate-work detection** — merge, squash, promotion and copied commits are excluded and moved code is discounted, so totals and trends count each piece of work once.
 - **Identity management** — Bot detection, automatic merging of identities that share a name or an email, duplicate identity merging, developer exclusions.
 - **Anonymization** — HMAC-SHA256 hashing of developer identities, on by default.
-- **Incremental by default** — Re-runs fetch only new commits since the last extraction. Use `--full` to force a complete re-extraction.
+- **Incremental by default** — Re-runs fetch only new commits, each repo from its own latest stored commit, and a repo whose last run was interrupted resumes that run's window. Use `--full` to force a complete re-extraction.
 - **Resumable** — Extraction checkpoints, rate-limit handling with pause/resume.
 - **Re-runnable setup** — Add repos, toggle features, change config at any time.
 

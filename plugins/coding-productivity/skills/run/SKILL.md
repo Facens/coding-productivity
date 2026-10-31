@@ -40,7 +40,7 @@ find ~/.claude/plugins -path '*/coding-productivity/scripts/extract_github.py' 2
 
 Determine platform from config (`PLATFORM` key).
 
-Extraction is **incremental by default** -- the scripts auto-detect the latest commit timestamp in storage and only fetch newer data. When the user provides a date range, pass `--since`/`--until` to scope the extraction.
+Extraction is **incremental by default** -- the scripts start each repo from its own latest stored commit (a repo whose last run was interrupted resumes that run's window) and only fetch newer data. When the user provides a date range, pass `--since`/`--until` to scope the extraction.
 
 For GitHub:
 ```bash

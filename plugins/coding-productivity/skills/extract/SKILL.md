@@ -57,7 +57,7 @@ Read the `PLATFORM` value from `.coding-productivity.env`. It will be either `gi
 
 ## Step 5: Run Extraction
 
-Extraction is **incremental by default** — the scripts auto-detect the latest commit timestamp in storage and only fetch newer data. On first run (empty database), all history is fetched.
+Extraction is **incremental by default** — the scripts start each repo from its own latest stored commit (a repo whose last run was interrupted resumes that run's window) and only fetch newer data. A configured repo with no stored commits starts from the latest commit in storage; extract it alone with `--full` for its history. On first run (empty database), all history is fetched.
 
 If the user explicitly provides a date range (e.g., `/coding-productivity:extract February 2026`), parse it and pass `--since`/`--until`. If the user asks for a full re-extraction, add `--full`.
 

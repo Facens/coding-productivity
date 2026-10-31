@@ -38,7 +38,7 @@ from lib.storage import get_storage, Storage
 from lib.github_client import GitHubClient
 from lib import checkpoint
 from lib import anonymize
-from lib import bots, coverage, merge_requests
+from lib import bots, coverage, merge_requests, watermark
 
 # ---------------------------------------------------------------------------
 # Identity columns that must be pseudonymized when anonymization is enabled.
@@ -608,6 +608,11 @@ def _process_repo(
 
     stats: dict = {"commits": 0, "diffs": 0, "prs": 0, "pr_commits": 0}
 
+    # Record the window before anything is stored, so an interrupted run
+    # resumes it instead of starting from this repo's newest stored commit.
+    ckpt = checkpoint.load(slug, quiet=True) or {"phase": "start"}
+    checkpoint.save(slug, {**ckpt, "run_since": since or ""})
+
     try:
         # 1. Commits
         stats["commits"] = _extract_commits(
@@ -669,7 +674,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--since",
         help="Start date for extraction (YYYY-MM-DD).  "
-             "Defaults to 1 day before the latest commit in storage (incremental).",
+             "Defaults to each repo's latest stored commit (incremental).",
     )
     parser.add_argument(
         "--until",
@@ -717,20 +722,15 @@ def main(argv: list[str] | None = None) -> None:
     storage.create_tables()
 
     # ── Auto-since (incremental by default) ─────────────────────────────
-    if not args.since and not args.full:
-        try:
-            rows = storage.query(
-                "SELECT MAX(committed_date) AS latest FROM commits"
-            )
-            latest = rows[0].get("latest") if rows else None
-            if latest:
-                # Use the exact timestamp of the latest commit — SHA dedup
-                # handles any overlap, so no buffer needed.
-                dt = datetime.fromisoformat(str(latest).replace("Z", "+00:00"))
-                args.since = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                print(f"  Auto-since:  {args.since} (latest commit in storage)", flush=True)
-        except Exception:
-            pass  # empty DB or table missing — will do full extraction
+    # Per repo, from its own latest commit (lib/watermark.py). The store's
+    # latest commit is only the fallback for a repo with none; with an empty
+    # store everything is extracted in full. SHA dedup handles any overlap.
+    auto_since = not args.since and not args.full
+    store_latest = watermark.latest_commit(storage) if auto_since else None
+    if store_latest:
+        print("  Auto-since:  per repo, from its latest stored commit", flush=True)
+    else:
+        auto_since = False
 
     # ── Bot overrides ─────────────────────────────────────────────────────
     if cfg.BOT_OVERRIDES:
@@ -757,7 +757,7 @@ def main(argv: list[str] | None = None) -> None:
     # ── Run ────────────────────────────────────────────────────────────────
     print(f"GitHub extraction starting", flush=True)
     print(f"  Repos:       {', '.join(repos)}", flush=True)
-    print(f"  Since:       {args.since or '(all)'}", flush=True)
+    print(f"  Since:       {'per repo' if auto_since else args.since or '(all)'}", flush=True)
     print(f"  Until:       {args.until or '(all)'}", flush=True)
     print(f"  Batch size:  {args.batch_size:,}", flush=True)
     print(f"  Anonymize:   {cfg.ANONYMIZATION_ENABLED}", flush=True)
@@ -773,9 +773,18 @@ def main(argv: list[str] | None = None) -> None:
     try:
         with storage:
             for repo_slug in repos:
+                since = args.since
+                if auto_since:
+                    since, why = watermark.resolve(
+                        watermark.latest_commit(
+                            storage, "LOWER(project_path) = $repo", {"repo": repo_slug.lower()}),
+                        store_latest,
+                        checkpoint.load(repo_slug.replace("/", "_"), quiet=True),
+                    )
+                    print(f"\n[{repo_slug}] Since: {since or '(all)'} ({why})", flush=True)
                 stats = _process_repo(
                     client, storage, repo_slug,
-                    since=args.since, until=args.until,
+                    since=since, until=args.until,
                     batch_size=args.batch_size,
                     anon_key=anon_key, merges=merges,
                     mapping_path=mapping_path,
