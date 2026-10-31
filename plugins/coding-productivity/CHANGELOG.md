@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- An interrupted extraction made the next incremental run skip history without an error. The start date was the latest commit in the whole store, so after a run that stopped once some repos had stored today's commits, every other repo started from today too. On a GitHub dataset of 26 repos, a run stopped after the fourth repo made the next one skip October 1-29 for the other 22. `extract_github.py` and `extract_gitlab.py` now start each repo from its own latest stored commit (GitHub matched on `project_path`, GitLab on `project_id`). A repo with no stored commits falls back to the store's latest commit, as before, and the run says so.
+- A repo interrupted mid-run resumes the window that run used. Its checkpoint now records `run_since`, kept across the phase saves that follow, because a partly stored repo's latest commit says nothing about the older commits still missing. A checkpoint left by an earlier version has no window; the run says so and asks for an explicit `--since`.
+
+### Added
+
+- `scripts/lib/watermark.py`: the per-repo start date (`latest_commit`, `resolve`). `checkpoint.load(..., quiet=True)` reads a checkpoint without the resume message.
+
 ## 0.16.0
 
 `analyze` now runs on the BigQuery backend, buckets months by commit date, and the pseudonymization key can be read as hex. Found by migrating two real BigQuery datasets (a GitLab and a GitHub one) from an earlier pipeline into the plugin.

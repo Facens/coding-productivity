@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.config import Config
 from lib.storage import get_storage
 from lib.gitlab_client import GitLabClient
-from lib import bots, checkpoint, anonymize, coverage, merge_requests
+from lib import bots, checkpoint, anonymize, coverage, merge_requests, watermark
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -434,8 +434,14 @@ def run(
     since: str | None,
     until: str | None,
     batch_size: int = 500,
+    store_latest: str | None = None,
 ):
-    """Execute the full GitLab extraction pipeline."""
+    """Execute the full GitLab extraction pipeline.
+
+    With *since* unset and *store_latest* set (an incremental run), each
+    project starts from its own latest stored commit, *store_latest* being the
+    fallback for a project with none (lib/watermark.py).
+    """
 
     # ── Validate config ──────────────────────────────────────────────────
     token = config.GITLAB_TOKEN
@@ -457,7 +463,7 @@ def run(
     print("GitLab Extraction", flush=True)
     print("=" * 60, flush=True)
     print(f"  Instance : {base_url}", flush=True)
-    print(f"  Since    : {since or '(all)'}", flush=True)
+    print(f"  Since    : {since or ('per project' if store_latest else '(all)')}", flush=True)
     print(f"  Until    : {until or '(all)'}", flush=True)
     print(f"  Batch    : {batch_size}", flush=True)
 
@@ -537,14 +543,24 @@ def run(
             print("  Already completed (checkpoint). Skipping.", flush=True)
             continue
 
+        project_since = since
+        if since is None and store_latest:
+            project_since, why = watermark.resolve(
+                watermark.latest_commit(
+                    storage, "project_id = $pid", {"pid": str(project["id"])}),
+                store_latest,
+                cp,
+            )
+            print(f"  Since: {project_since or '(all)'} ({why})", flush=True)
+
         # Phase 1: commits & diffs
         if not cp or cp.get("phase") != "mrs":
-            checkpoint.save(slug, {"phase": "commits"})
+            checkpoint.save(slug, {"phase": "commits", "run_since": project_since or ""})
             c, d, _ = _extract_commits(
                 client,
                 storage,
                 project,
-                since=since,
+                since=project_since,
                 until=until,
                 batch_size=batch_size,
                 existing_shas=existing_shas,
@@ -561,7 +577,7 @@ def run(
             client,
             storage,
             project,
-            since=since,
+            since=project_since,
             until=until,
             batch_size=batch_size,
             anon_key=anon_key,
@@ -607,7 +623,7 @@ def main() -> None:
     parser.add_argument(
         "--since",
         help="Start date (YYYY-MM-DD or ISO 8601).  "
-             "Defaults to the latest commit in storage (incremental).",
+             "Defaults to each project's latest stored commit (incremental).",
     )
     parser.add_argument(
         "--until",
@@ -633,22 +649,20 @@ def main() -> None:
         sys.exit(1)
 
     # ── Auto-since (incremental by default) ─────────────────────────
+    # Per project, from its own latest commit (lib/watermark.py); the store's
+    # latest commit is the fallback for a project with none.
+    store_latest = None
     if not args.since and not args.full:
-        from lib.storage import get_storage
         try:
             st = get_storage(config)
-            rows = st.query("SELECT MAX(committed_date) AS latest FROM commits")
-            latest = rows[0].get("latest") if rows else None
+            store_latest = watermark.latest_commit(st)
             st.close()
-            if latest:
-                from datetime import datetime, timezone
-                dt = datetime.fromisoformat(str(latest).replace("Z", "+00:00"))
-                args.since = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                print(f"  Auto-since:  {args.since} (latest commit in storage)", flush=True)
         except Exception:
             pass  # empty DB — will need explicit dates or --full
+        if store_latest:
+            print("  Auto-since:  per project, from its latest stored commit", flush=True)
 
-    if not args.since and not args.full:
+    if not args.since and not args.full and not store_latest:
         print("Error: No existing data found. Provide --since/--until or use --full for first extraction.",
               file=sys.stderr)
         sys.exit(1)
@@ -660,6 +674,7 @@ def main() -> None:
             since=args.since,
             until=args.until,
             batch_size=args.batch_size,
+            store_latest=store_latest,
         )
     except KeyboardInterrupt:
         print("\nExtraction interrupted by user.", flush=True)

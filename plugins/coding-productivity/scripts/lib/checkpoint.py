@@ -29,10 +29,11 @@ def _checkpoint_path(repo_slug: str) -> Path:
 # ── Public API ────────────────────────────────────────────────────────────────
 
 
-def load(repo_slug: str) -> Optional[dict]:
+def load(repo_slug: str, quiet: bool = False) -> Optional[dict]:
     """Load a saved checkpoint for *repo_slug*, or return ``None``.
 
-    When an existing checkpoint is found a message is printed to stdout.
+    When an existing checkpoint is found a message is printed to stdout,
+    unless *quiet*.
     """
     path = _checkpoint_path(repo_slug)
     if not path.is_file():
@@ -40,6 +41,8 @@ def load(repo_slug: str) -> Optional[dict]:
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
+        if quiet:
+            return data
         print(
             f"  Resuming from checkpoint for {repo_slug} "
             f"(phase={data.get('phase')}, page={data.get('last_page')})...",
@@ -61,6 +64,16 @@ def save(repo_slug: str, state: dict) -> None:
     state.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
 
     target = _checkpoint_path(repo_slug)
+
+    # The window a run started with outlives the phase saves that follow it, so
+    # a resumed run covers the same window (see lib/watermark.py).
+    if "run_since" not in state and target.is_file():
+        try:
+            previous = json.loads(target.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            previous = {}
+        if "run_since" in previous:
+            state["run_since"] = previous["run_since"]
     tmp = target.with_suffix(".tmp")
 
     tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
