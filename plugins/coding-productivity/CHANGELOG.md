@@ -1,11 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.16.1
+
+Incremental extraction no longer loses history after an interrupted run, and `rebase` reads its inputs in bulk on BigQuery.
 
 ### Fixed
 
 - An interrupted extraction made the next incremental run skip history without an error. The start date was the latest commit in the whole store, so after a run that stopped once some repos had stored today's commits, every other repo started from today too. On a GitHub dataset of 26 repos, a run stopped after the fourth repo made the next one skip October 1-29 for the other 22. `extract_github.py` and `extract_gitlab.py` now start each repo from its own latest stored commit (GitHub matched on `project_path`, GitLab on `project_id`). A repo with no stored commits falls back to the store's latest commit, as before, and the run says so.
 - A repo interrupted mid-run resumes the window that run used. Its checkpoint now records `run_since`, kept across the phase saves that follow, because a partly stored repo's latest commit says nothing about the older commits still missing. A checkpoint left by an earlier version has no window; the run says so and asks for an explicit `--since`.
+
+### Changed
+
+- `rebase` read each commit and its diffs with two queries, one after the other, so on BigQuery a 48k-commit rebase spent days building batch requests before submitting any. Commits and diffs are now read in chunks of 250 through a list parameter (`dialect.in_list_param`), eight chunks at a time on BigQuery and serially on DuckDB. Measured: 2,000 commits with 7,459 diffs read in 4 s on BigQuery.
 
 ### Added
 
