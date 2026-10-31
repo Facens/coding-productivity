@@ -41,7 +41,8 @@ def load(repo_slug: str, quiet: bool = False) -> Optional[dict]:
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        if quiet:
+        # "start" only records the window of a run in progress: nothing to resume.
+        if quiet or data.get("phase") == "start":
             return data
         print(
             f"  Resuming from checkpoint for {repo_slug} "

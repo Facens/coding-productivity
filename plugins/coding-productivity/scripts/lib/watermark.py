@@ -33,7 +33,10 @@ def latest_commit(storage, where: str = "", params: Optional[dict] = None) -> Op
         sql += f" WHERE {where}"
     try:
         rows = storage.query(sql, params or None)
-    except Exception:
+    except Exception as exc:
+        # Loud: for one repo, None means "fall back to the store's latest
+        # commit", which is the gap this module exists to prevent.
+        print(f"  Warning: could not read the latest commit ({exc})", flush=True)
         return None
     return _iso(rows[0].get("latest")) if rows else None
 
