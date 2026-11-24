@@ -6,7 +6,7 @@ argument-hint: '[date range, e.g. "January 2026", "last 3 months", "2025-06 to 2
 
 # Run Full Pipeline
 
-Run extract -> score (if enabled) -> dedupe -> analyze -> report in sequence for a given time period.
+Run extract -> score (if enabled) -> dedupe -> analyze -> roster check in sequence for a given time period.
 
 ## Step 1: Parse Date Range
 
@@ -100,7 +100,17 @@ Keep the `identity:` lines too. They list the identities `analyze` joined into o
 
 If an analysis exits with an error that the date range mixes scoring models, stop and explain it (a trend across two models is a trend in the instrument). Offer a narrower range, or `/coding-productivity:calibrate` then `/coding-productivity:rebase`.
 
-## Step 7: Summary
+## Step 7: Roster Check
+
+Last, run the report-only roster check for the same range. It never changes the config and exits 0 whether or not it finds anything:
+
+```bash
+{venv_python} {scripts_dir}/roster_check.py --config .coding-productivity.env --since {since} --until {until}
+```
+
+Show its output. It lists people to add to `EXCLUDED_DEVELOPERS` (an excluded person committing from a new email still counts as a developer), new people to confirm, and merge candidates. Do not apply anything yourself: offer `/coding-productivity:developers` for the decisions, and say that the figures above count the people it lists until they are decided. "No findings." needs no action.
+
+## Step 8: Summary
 
 After all steps complete, display:
 
@@ -112,6 +122,7 @@ Scoring:     {scored_count} commits scored (or "Skipped -- not enabled")
 Duplicates:  {excluded_count} commits excluded, {moved_files} files with moved code
 Identities:  {merged_count} merged
 Analysis:    4 reports generated
+Roster:      {leaks} to exclude, {new} new to confirm, {pairs} merge candidates
 
 Next steps:
 - /coding-productivity:report {date_range} -- Generate executive summary document

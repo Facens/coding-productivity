@@ -132,6 +132,22 @@ Display the roster as:
  ...
 ```
 
+## Periodic Check: What Needs a Decision
+
+To find out what to add, exclude or merge without walking the whole roster, run the report-only roster check for the period you are about to analyze (`--until` is exclusive, as in `analyze`):
+
+```
+python3.14 scripts/roster_check.py --config .coding-productivity.env --since YYYY-MM-DD --until YYYY-MM-DD
+```
+
+It reports, and changes nothing:
+
+1. **To exclude** -- a person with some emails in `EXCLUDED_DEVELOPERS` and some not. The exclusion list is exact per email and is applied before emails are joined into people, so the uncovered emails count as developers. It prints the emails to append.
+2. **New, to confirm** -- people whose first commit is in the period. Confirm they are developers, or exclude them (Action 3).
+3. **Merge candidates** -- likely duplicates not yet one person, with `IDENTITY_MERGES=` and `IDENTITY_NO_MERGE=` lines (Action 2).
+
+The exit code is 0 whether or not there are findings. Read the output, then apply each decision with the actions below. With anonymization on, the check shows real names when `.coding-productivity/developer_mapping.json` exists and hashes otherwise; `EXCLUDED_DEVELOPERS` must hold the hashes then, and the paste-ready line does.
+
 ## Step 4: Offer Actions
 
 Ask via `AskUserQuestion`:

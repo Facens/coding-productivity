@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.17.0
+
+A report-only roster check: who counts as a developer, reviewed on a schedule instead of found by accident.
+
+### Added
+
+- `scripts/roster_check.py` (`--config`, `--since`, `--until`, optional `--output`). It reads the stored commits (`REPOS` applied, `EXCLUDED_DEVELOPERS` not, all dates), resolves identities exactly as `analyze` does and reports three sections:
+  1. **To exclude (leak):** a person with at least one email in `EXCLUDED_DEVELOPERS` and at least one not in it. `analyze` applies the exclusion list per email before it joins emails into people, so an excluded person who commits from a new address (a GitHub noreply address, a second work email) was counted as a developer. The report shows the uncovered emails with commit counts (all time and in the period) and a paste-ready list to append.
+  2. **New, to confirm:** counted people whose first commit in the whole dataset falls in the period: confirm a developer, or exclude.
+  3. **Merge candidates:** the pairs `lib/dedup.find_duplicates` finds that are not already one person, not in `IDENTITY_NO_MERGE` and not both excluded, with `IDENTITY_MERGES=` and `IDENTITY_NO_MERGE=` lines to paste. A pair with one excluded side is kept (that is how a handle-versus-full-name leak shows) and points to `EXCLUDED_DEVELOPERS` instead of a merge, because a merge cannot cover an email the exclusion filter removes first.
+- The check never changes the config. The exit code is 0 whenever it ran, with or without findings, and non-zero only for real errors; `--output` writes the report only when there are findings and removes a stale file when there are none. The period is `analyze`'s: `--since` inclusive, `--until` exclusive, on `DATE_FIELD`.
+- With anonymization on, a `.coding-productivity/developer_mapping.json` next to the config turns hashes into real names and emails; without it the report shows hashes and points to `/coding-productivity:developers`. Membership in `EXCLUDED_DEVELOPERS` is the same exact comparison against the stored value that `analyze` makes, so with anonymization on that list must hold the hashes, and the paste-ready line does.
+- The `developers` and `run` skills and the README describe the check as the periodic way to spot what to add, exclude or merge; `run` ends with it.
+
 ## 0.16.1
 
 Incremental extraction no longer loses history after an interrupted run, and `rebase` reads its inputs in bulk on BigQuery.

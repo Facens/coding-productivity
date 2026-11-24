@@ -57,7 +57,7 @@ Or run each step individually:
 | Skill | Description |
 |-------|-------------|
 | `setup` | Interactive configuration wizard |
-| `run` | Full pipeline: extract → score → dedupe → analyze. Accepts date range (e.g., `run January 2026`) |
+| `run` | Full pipeline: extract → score → dedupe → analyze → roster check. Accepts date range (e.g., `run January 2026`) |
 | `extract` | Pull commits, diffs, PRs. Accepts date range or repo slug |
 | `score` | AI-powered commit scoring with `SCORING_MODEL` |
 | `dedupe` | Detect duplicate work (merge, squash, promotion, copy, moved code) so `analyze` counts it once |
@@ -66,7 +66,7 @@ Or run each step individually:
 | `analyze` | Interactive productivity analysis |
 | `report` | Generate executive summary in markdown |
 | `connect` | Connect to existing BigQuery dataset (read-only) |
-| `developers` | Developer roster: bots, dedup, exclusions |
+| `developers` | Developer roster: bots, dedup, exclusions; the periodic roster check |
 | `validate` | Compare results against a reference dataset |
 
 ## Configuration
@@ -124,6 +124,18 @@ A developer count that depends on how many addresses someone commits from is wro
 `unique_authors` in monthly trends and period comparison, and the per-author table, count and group people. The author table shows each person under their most-used stored name and email. `analyze` prints the automatic merges it applied (stored names and emails, with commit counts) and the accounts it excluded, so you can review them. With anonymization on the report shows pseudonyms, not names, so a wrong merge is not readable from it: to check one, run `/coding-productivity:developers`, which resolves pseudonyms locally. Two different people with the same name are the typical false positive. Undo one by adding the two emails to `IDENTITY_NO_MERGE`.
 
 `MIN_ACTIVE_COMMITS` (default 1) is the number of commits a person needs in a month to count as an active developer. At the default nothing changes. Above 1, monthly trends gain two columns, `active_developers` and `productivity_per_active_developer` (the productivity of those developers divided by their number; lines changed when nothing is scored). `unique_authors` stays as it was, so both views are visible. The columns appear only above 1 so the default output and every existing number stay as they were.
+
+### Roster check
+
+`EXCLUDED_DEVELOPERS` is an exact per-email list applied before emails are joined into people, so an excluded person who commits from a new address (a GitHub noreply address, a second work email) counts as a developer without any message. New people also start counting with nobody looking at them. `scripts/roster_check.py` is the periodic, report-only review:
+
+```
+python3.14 scripts/roster_check.py --config .coding-productivity.env --since 2026-10-01 --until 2026-11-01 [--output roster.txt]
+```
+
+It resolves identities as `analyze` does (stored commits, `REPOS` applied, the exclusion list not, all dates) and prints up to three sections: **to exclude** (a person with some emails excluded and some not, with the uncovered emails, their commit counts and a paste-ready list for `EXCLUDED_DEVELOPERS`), **new, to confirm** (people whose first commit in the whole dataset is in the period) and **merge candidates** (pairs from `lib/dedup.find_duplicates` that are not already one person, not in `IDENTITY_NO_MERGE` and not both excluded, with `IDENTITY_MERGES=` / `IDENTITY_NO_MERGE=` lines). `--until` is exclusive, as in `analyze`.
+
+It never changes the config. The exit code is 0 whenever the check ran, findings or not, so a scheduled wrapper does not treat findings as a failure; it is non-zero only for real errors. `--output` writes the report only when there are findings. With anonymization on it reads `.coding-productivity/developer_mapping.json` (next to the config) to show real names and emails, and shows hashes otherwise; the exclusion list is compared with the stored values exactly as `analyze` does, so it must hold the hashes. The developer count itself stays dynamic per month; the check does not fix a headcount.
 
 ### Commit date
 
